@@ -254,3 +254,37 @@ async def test_toggle_button_flips_a_boolean(tmp_path):
     await dispatch(event)
     assert settings.get_bool("FORCE_JOIN_ENABLED", True) is False
     assert any("বন্ধ" in (answer[0] or "") for answer in event.answers)
+
+
+# ------------------------------------------------------------ secrets watchdog
+def test_secrets_guard_flags_a_committed_env_file(tmp_path):
+    import subprocess
+
+    from app.services import secrets_guard
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "config.env").write_text(
+        "API_ID=123\nBOT_TOKEN=12345:SECRET\nAPI_HASH=abcdef\nSTRING_SESSION=\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "config.env"], cwd=repo, check=True)
+
+    report = secrets_guard.audit(repo_dir=repo, env_file=repo / "config.env")
+    assert report["tracked"] is True
+    assert "BOT_TOKEN" in report["secrets"] and "API_HASH" in report["secrets"]
+    assert "STRING_SESSION" not in report["secrets"]        # empty → not leaked
+    assert secrets_guard.warning_lines(report)
+
+
+def test_secrets_guard_is_quiet_when_env_is_untracked(tmp_path):
+    from app.services import secrets_guard
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "config.env").write_text("BOT_TOKEN=12345:SECRET\n", encoding="utf-8")
+    # no git repo at all → nothing to warn about
+    report = secrets_guard.audit(repo_dir=repo, env_file=repo / "config.env")
+    assert report["tracked"] is False
+    assert secrets_guard.warning_lines(report) == []

@@ -13,7 +13,7 @@ from telethon.sessions import StringSession
 
 from app import config as cfg, runtime
 from app.logger import log, setup_logging
-from app.services import scheduler
+from app.services import secrets_guard
 from app.storage import db
 
 
@@ -84,6 +84,7 @@ def main() -> int:
     imported = db.migrate_legacy(cfg.LEGACY_DB_FILE)
     if imported:
         log.info("Imported the legacy bot_db.json: %s", imported)
+    secrets_guard.log_report()
 
     def handle_loop_exception(loop, context):
         log.error("Unhandled loop error: %s (%s)", context.get("message"), context.get("exception"))
