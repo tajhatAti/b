@@ -16,7 +16,12 @@ T = TypeVar("T")
 
 # ------------------------------------------------------------------ time bits
 def _tz():
-    return timezone(timedelta(hours=cfg.TZ_OFFSET))
+    from app.services import settings
+    try:
+        offset = settings.get_float("TZ_OFFSET", 6.0)
+    except Exception:            # settings not ready (very early import)
+        offset = cfg.TZ_OFFSET
+    return timezone(timedelta(hours=offset))
 
 
 def now_ts() -> float:

@@ -202,3 +202,76 @@ def test_start_button_queues_the_campaign_while_the_bot_is_offline(client, monke
     assert "warn=" in response.headers["location"]
     assert db.campaign(campaign["id"])["status"] == broadcast.QUEUED
     assert [c["id"] for c in db.queued_campaigns()] == [campaign["id"]]
+
+
+# ---------------------------------------------------------------- settings page
+def test_settings_page_shows_every_group(client):
+    page = client.get("/admin/settings", headers=_auth())
+    assert page.status_code == 200
+    for label in ("চ্যানেল জয়েন", "পেমেন্ট", "সাপোর্ট", "ব্রডকাস্ট গতি"):
+        assert label in page.text, f"{label} group missing"
+    assert "FORCE_CHANNEL" in page.text
+
+
+def test_settings_can_be_saved_from_the_website(client, monkeypatch):
+    from app import config as cfg
+    from app.services import forcejoin, settings
+    monkeypatch.setattr(cfg, "FORCE_CHANNEL", "")
+    settings._cache.clear()
+
+    response = client.post("/admin/settings/save", headers=_auth(),
+                           data={"__group": "payments", "CURRENCY": "৳",
+                                 "PAY_BKASH": "01712-345678", "PAY_NAGAD": "",
+                                 "PAY_ROCKET": "", "PAY_UPI": "", "PAY_CRYPTO": "",
+                                 "PAY_NOTE": "", "TRIAL_HOURS": "48",
+                                 "AUTO_APPROVE_ZERO": "1"},
+                           follow_redirects=False)
+    assert response.status_code == 303
+    assert settings.get_str("PAY_BKASH") == "01712-345678"
+    assert settings.get_int("TRIAL_HOURS") == 48
+    assert settings.get_bool("AUTO_APPROVE_ZERO", False) is True
+
+
+def test_force_join_accepts_a_private_invite_from_the_website(client, monkeypatch):
+    from app import config as cfg
+    from app.services import forcejoin, settings
+    monkeypatch.setattr(cfg, "FORCE_CHANNEL", "")
+    settings._cache.clear()
+
+    response = client.post("/admin/settings/save", headers=_auth(),
+                           data={"__group": "force_join",
+                                 "FORCE_JOIN_ENABLED": "1",
+                                 "FORCE_CHANNEL": "https://t.me/+PrivateInvite99",
+                                 "FORCE_JOIN_NOTE": ""},
+                           follow_redirects=False)
+    assert response.status_code == 303
+    assert forcejoin.switch() == "https://t.me/+PrivateInvite99"
+    assert "PrivateInvite99" in settings.get_str("FORCE_CHANNEL")
+
+
+def test_website_refuses_a_bad_value(client, monkeypatch):
+    from app import config as cfg
+    from app.services import settings
+    monkeypatch.setattr(cfg, "FORCE_CHANNEL", "")
+    settings._cache.clear()
+
+    response = client.post("/admin/settings/save", headers=_auth(),
+                           data={"__group": "force_join", "FORCE_JOIN_ENABLED": "1",
+                                 "FORCE_CHANNEL": "?? not a channel", "FORCE_JOIN_NOTE": ""},
+                           follow_redirects=False)
+    assert response.status_code == 303
+    assert "warn=" in response.headers["location"]
+    assert settings.get_str("FORCE_CHANNEL") == ""     # nothing stored
+
+
+def test_config_env_export(client):
+    response = client.get("/admin/settings/export", headers=_auth())
+    assert response.status_code == 200
+    assert "FORCE_CHANNEL=" in response.text
+    assert "config.env" in response.headers.get("content-disposition", "")
+
+
+def test_public_site_uses_saved_title(client):
+    from app.services import settings
+    settings.set("SITE_TAGLINE", "এখানেই সব ভিডিও")
+    assert "এখানেই সব ভিডিও" in client.get("/").text

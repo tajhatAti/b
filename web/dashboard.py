@@ -47,7 +47,7 @@ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,     # n
 from app import config as cfg                                                 # noqa: E402
 from app import runtime                                                       # noqa: E402
 from app.logger import log, setup_logging                                     # noqa: E402
-from app.services import access, billing, broadcast                           # noqa: E402
+from app.services import access, billing, broadcast, forcejoin, settings      # noqa: E402
 from app.storage import db                                                    # noqa: E402
 from app.utils import esc, fmt_ts, human_size, money                          # noqa: E402
 
@@ -140,6 +140,8 @@ CSS = """
                  border-radius:9px; padding:10px 12px; width:100%; margin:6px 0; font:inherit; }
  label { font-size:13px; color:var(--mut); }
  .muted { color:var(--mut); font-size:13px; }
+ .chk { display:flex; align-items:center; gap:8px; color:#e8eef7; font-size:14px; margin:8px 0; }
+ .chk input { width:auto; margin:0; }
  .pill { background:#1f2937; padding:2px 9px; border-radius:999px; font-size:12px; }
  .flash { background:#06443a; border:1px solid #0b7a5f; padding:11px 14px; border-radius:11px; margin-bottom:14px; }
  .warnbox { background:#4a2c06; border:1px solid #92610d; padding:11px 14px; border-radius:11px; margin-bottom:14px; }
@@ -179,7 +181,7 @@ def layout(title: str, body: str, active: str = "", admin: bool = True) -> str:
     )
     right = ('<a class="btn grey" href="/admin/logout">Logout</a>' if admin
              else '<a class="btn" href="/admin">Admin</a>')
-    brand = html.escape(cfg.WEB_TITLE or "Store") + " · Bot"
+    brand = html.escape(settings.get_str("WEB_TITLE", "Store") or "Store") + " · Bot"
     return f"""<!doctype html><html lang="bn"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{html.escape(title)} · {brand}</title>
@@ -236,7 +238,7 @@ def create_app() -> FastAPI:
         body = f"""
         <div class="hero">
           <h2>এক ট্যাপে ফাইল, সিরিজ আর ভিডিও 🎬</h2>
-          <p>{esc(cfg.SITE_TAGLINE) or "টেলিগ্রাম বটে স্টোর থেকে ফাইল বেছে নিন — বটই ফাইলটি পাঠিয়ে দেবে। নিচের যেকোনো স্টোরে ঢুকুন।"}</p>
+          <p>{esc(settings.get_str("SITE_TAGLINE")) or "টেলিগ্রাম বটে স্টোর থেকে ফাইল বেছে নিন — বটই ফাইলটি পাঠিয়ে দেবে। নিচের যেকোনো স্টোরে ঢুকুন।"}</p>
           <div class="row">
             {f'<a class="btn" href="https://t.me/{bots}">🤖 বটে যান (@{bots})</a>' if bots else ''}
             <a class="btn grey" href="#stores">🏪 স্টোর দেখুন</a>
@@ -388,7 +390,7 @@ def create_app() -> FastAPI:
         <div class="grid">
           {card("Users", stats['users'])} {card("Files", stats['files'])}
           {card("Stores", stats['stores'])} {card("Views", stats['views'])}
-          {card("Granted", stats['grants'])} {card("Revenue", money(revenue['total'], cfg.CURRENCY))}
+          {card("Granted", stats['grants'])} {card("Revenue", money(revenue['total'], settings.get_str('CURRENCY', '৳')))}
           {card("Pending orders", revenue['pending'])} {card("Open tickets", stats['tickets_open'])}
         </div>
         <p class="muted">বট: {bot_state} · সার্ভার আপটাইম: {int(time.time() - STARTED_AT)}s · আজ: {today}</p>
@@ -653,7 +655,7 @@ def create_app() -> FastAPI:
                 f"<tr><td><b>{esc(store['name'])}</b><div class='muted'>#{store['id']} · "
                 f"{'🔒 premium' if store['is_premium'] else '🆓 free'}</div></td>"
                 f"<td>{stats['files']}</td><td>{stats['views']}</td><td>{stats['grants']}</td>"
-                f"<td>{money(sales['revenue'], cfg.CURRENCY)}</td>"
+                f"<td>{money(sales['revenue'], settings.get_str('CURRENCY', '৳'))}</td>"
                 f"<td>{len(db.plans(store['id'], only_active=True))}</td><td>{drip_txt}</td>"
                 f"<td><a class='btn grey' href='/s/{esc(store['slug'] or store['id'])}'>সাইটে দেখুন</a> "
                 f"<a class='btn' href='/admin/files?store={store['id']}'>ফাইল</a></td></tr>")
@@ -916,34 +918,133 @@ def create_app() -> FastAPI:
                               "created_at"], rows, "files.csv")
 
     # -------------------------------------------------------------- settings
+    def _field(item, key_prefix: str = "") -> str:
+        """One form row, rendered from the settings registry."""
+        name = f"{key_prefix}{item.key}"
+        value = settings.get(item.key)
+        if item.kind == "bool":
+            checked = " checked" if value else ""
+            return (f'<label class="chk"><input type="checkbox" name="{name}" '
+                    f'value="1"{checked}> {esc(item.label)}</label>')
+        if item.kind == "long":
+            inner = (f'<textarea name="{name}" rows="3" placeholder="{esc(item.placeholder)}">'
+                     f'{esc(value)}</textarea>')
+        else:
+            shown = "" if value is None else value
+            input_type = "number" if item.kind in ("int", "float") else "text"
+            step = ' step="any"' if item.kind == "float" else ""
+            inner = (f'<input type="{input_type}"{step} name="{name}" '
+                     f'value="{esc(shown)}" placeholder="{esc(item.placeholder)}">')
+        badge = {"db": "প্যানেল", "env": "config.env", "default": "ডিফল্ট"}.get(
+            settings.source(item.key), "")
+        hint = f'<div class="muted">{esc(item.hint)}</div>' if item.hint else ""
+        return (f'<label>{esc(item.label)} <span class="pill">{badge}</span></label>'
+                f'{inner}{hint}')
+
     @app.get("/admin/settings", response_class=HTMLResponse)
-    async def admin_settings(request: Request):
+    async def admin_settings(request: Request, flash: str = "", warn: str = ""):
         blocked = _guard(request)
         if blocked:
             return blocked
-        stats = db.stats()
+        note = f'<div class="flash">{esc(flash)}</div>' if flash else ""
+        warnbox = f'<div class="warnbox">{esc(warn)}</div>' if warn else ""
+        bot_ok = runtime.bot_online()
+        groups_html = []
+        for group in settings.all_groups():
+            fields = "".join(_field(item) for item in group.settings)
+            extra = ""
+            if group.key == "force_join":
+                link = forcejoin.join_url()
+                resolved_id = db.get_meta("force_channel_id", "")
+                extra = (f'<p class="muted">🔗 জয়েন লিংক: '
+                         f'<code>{esc(link) or "—"}</code> · '
+                         f'🆔 <code>{esc(resolved_id) or "— এখনো রেজলভ হয়নি —"}</code></p>'
+                         f'<p class="muted">প্রাইভেট চ্যানেল হলে ইনভাইট লিংক '
+                         f'(<code>t.me/+…</code>) দিন — বট সেটাও বুঝবে।</p>')
+            groups_html.append(f"""
+            <div class="card" style="margin-bottom:14px">
+              <h3>{group.icon} {esc(group.label)}</h3>
+              <p class="muted">{esc(group.blurb)}</p>
+              <form method=post action="/admin/settings/save">
+                <input type="hidden" name="__group" value="{group.key}">
+                {fields}
+                {extra}
+                <div class="row" style="margin-top:10px">
+                  <button class="ok" type="submit">💾 সেভ করুন</button>
+                </div>
+              </form>
+            </div>""")
         body = f"""
-        <h3>🛠 সেটিংস ও স্ট্যাটাস</h3>
+        {note}{warnbox}
+        <h3>⚙️ সেটিংস</h3>
+        <p class="muted">সব কিছু এখান থেকেই বদলানো যায় — বট রিস্টার্ট বা ফাইল এডিট লাগে না।
+        বটের ⚙️ Settings স্ক্রিনেও একই সেটিংস আছে। badge বলে দেয় মানটা কোথা থেকে আসছে
+        (প্যানেল / config.env / ডিফল্ট); কিছু সেভ করলে সেটা environment মানকে ওভাররাইড করে।</p>
         <div class="grid">
           {card("Bot", f"@{_bot_username() or '—'}")}
-          {card("Bot online", "✅" if runtime.bot_online() else "❌")}
+          {card("Bot online", "✅" if bot_ok else "❌")}
           {card("Uptime", f"{int(time.time() - STARTED_AT)}s")}
           {card("DB size", human_size(os.path.getsize(cfg.DB_FILE) if os.path.exists(cfg.DB_FILE) else 0))}
         </div>
-        <div class="card">
-          <h4>ব্রডকাস্ট সেটিংস</h4>
-          <p class="muted">BROADCAST_DELAY={cfg.BROADCAST_DELAY}s ·
-          BROADCAST_BATCH={cfg.BROADCAST_BATCH} · BROADCAST_BATCH_PAUSE={cfg.BROADCAST_BATCH_PAUSE}s ·
-          BROADCAST_MAX_FILES={cfg.BROADCAST_MAX_FILES} ·
-          auto-resume={'on' if cfg.BROADCAST_AUTO_RESUME else 'off'}</p>
-          <p class="muted">হোস্টিং প্যানেলের Environment Variables থেকে এগুলো বদলানো যায়।</p>
-        </div>
-        <div class="card">
-          <h4>ডেটা</h4>
-          <p class="muted">{stats['users']} ইউজার · {stats['files']} ফাইল · {stats['stores']} স্টোর ·
-          {stats['grants']} গ্রান্ট · {stats['links']} লিংক · {stats['tickets_open']} টিকেট</p>
-        </div>"""
+        <p class="row" style="margin:14px 0">
+          <a class="btn grey" href="/admin/settings/export">⬇️ config.env হিসেবে এক্সপোর্ট</a>
+          <a class="btn grey" href="/admin/download">📥 ডেটা এক্সপোর্ট</a>
+        </p>
+        {''.join(groups_html)}
+        """
         return layout("Settings", body, "/admin/settings")
+
+    @app.post("/admin/settings/save")
+    async def admin_settings_save(request: Request):
+        blocked = _guard(request)
+        if blocked:
+            return blocked
+        form = await request.form()
+        group_key = str(form.get("__group", "")).strip()
+        group = next((g for g in settings.all_groups() if g.key == group_key), None)
+        if group is None:
+            return RedirectResponse("/admin/settings?warn=অজানা+গ্রুপ", status_code=303)
+        values: dict[str, str] = {}
+        for item in group.settings:
+            raw = form.get(item.key)
+            if item.kind == "bool":
+                values[item.key] = "1" if raw is not None else "0"
+            else:
+                values[item.key] = "" if raw is None else str(raw)
+        errors = settings.set_many(values)
+        if group_key == "force_join":
+            forcejoin.clear_cache()
+            if not errors and settings.get_str("FORCE_CHANNEL"):
+                settings.set("FORCE_JOIN_ENABLED", "1")
+        if errors:
+            joined = "+".join(f"{key}:{msg}" for key, msg in errors.items())
+            return RedirectResponse(f"/admin/settings?warn={joined}", status_code=303)
+        return RedirectResponse(
+            f"/admin/settings?flash=✅+{group.label}+সেভ+হলো", status_code=303)
+
+    @app.get("/admin/settings/forcejoin/check")
+    async def admin_forcejoin_check(request: Request):
+        """Resolve the channel now (the bot or a session has to be online)."""
+        blocked = _guard(request)
+        if blocked:
+            return blocked
+        result = await forcejoin.resolve(refresh=True, use_cache=False)
+        if result.get("ok"):
+            message = (f"✅+চ্যানেল+পাওয়া+গেছে:+{result['title']}+"
+                       f"({result['chat_id']})")
+        else:
+            message = f"⚠️+চ্যানেল+পাওয়া+যায়নি:+{result.get('error') or '?'}"
+        return RedirectResponse(f"/admin/settings?flash={message}", status_code=303)
+
+    @app.get("/admin/settings/export")
+    async def admin_settings_export(request: Request):
+        blocked = _guard(request)
+        if blocked:
+            return blocked
+        body = settings.env_preview()
+        return Response(body, media_type="text/plain; charset=utf-8",
+                        headers={"Content-Disposition":
+                                 'attachment; filename="config.env"'})
 
     # ----------------------------------------------------------------- health
     @app.get("/health")

@@ -6,6 +6,7 @@ import asyncio
 
 from app import config as cfg
 from app.logger import log
+from app.services import settings
 from app.runtime import (blocked_users, bot, register_client,
                          unregister_client, user_clients)
 from app.services.access import has_access
@@ -174,7 +175,7 @@ async def campaign_loop() -> None:
     while True:
         try:
             if runtime.bot_online():
-                if cfg.BROADCAST_AUTO_RESUME:
+                if settings.get_bool("BROADCAST_AUTO_RESUME", True):
                     broadcast.resume_unfinished()
                 for campaign in db.due_campaigns():
                     if broadcast.is_running(campaign["id"]):

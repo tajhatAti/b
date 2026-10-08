@@ -86,21 +86,33 @@ def spawn(coro) -> asyncio.Task:
     return task
 
 
-# Settings backed by the database -------------------------------------------
+# Settings ---------------------------------------------------------------
+# Everything below can be changed from the bot panel *or* the website; the
+# `settings` service decides whether the value comes from the database, from
+# config.env or from the built-in default.
 def force_channel() -> str:
-    return db.get_meta("force_channel", cfg.FORCE_CHANNEL) or ""
+    from app.services import settings
+    return settings.get_str("FORCE_CHANNEL")
 
 
 def set_force_channel(value: str) -> None:
-    db.set_meta("force_channel", value)
+    from app.services import settings
+    settings.set("FORCE_CHANNEL", value)
+
+
+def force_join_on() -> bool:
+    from app.services import settings
+    return bool(settings.get_bool("FORCE_JOIN_ENABLED", True) and settings.get_str("FORCE_CHANNEL"))
 
 
 def caption() -> str:
-    return db.get_meta("custom_caption", cfg.CUSTOM_CAPTION) or ""
+    from app.services import settings
+    return settings.get_str("CUSTOM_CAPTION")
 
 
 def set_caption(value: str) -> None:
-    db.set_meta("custom_caption", value)
+    from app.services import settings
+    settings.set("CUSTOM_CAPTION", value)
 
 
 # Session helpers ------------------------------------------------------------

@@ -3,26 +3,24 @@ from __future__ import annotations
 
 import time
 
-from app import config as cfg
 from app.logger import log
-from app.services import access
+from app.services import access, settings
 from app.storage import db
 from app.utils import money
 
 
+PAYMENT_LABELS = (("PAY_BKASH", "bKash"), ("PAY_NAGAD", "Nagad"),
+                  ("PAY_ROCKET", "Rocket"), ("PAY_UPI", "UPI"),
+                  ("PAY_CRYPTO", "Crypto"))
+
+
 def payment_methods() -> list[tuple[str, str]]:
-    """(label, value) pairs configured by the admin, for the payment screen."""
+    """(label, value) pairs saved by the admin — from the bot or the website."""
     methods = []
-    if cfg.PAY_BKASH:
-        methods.append(("bKash", cfg.PAY_BKASH))
-    if cfg.PAY_NAGAD:
-        methods.append(("Nagad", cfg.PAY_NAGAD))
-    if cfg.PAY_ROCKET:
-        methods.append(("Rocket", cfg.PAY_ROCKET))
-    if cfg.PAY_UPI:
-        methods.append(("UPI", cfg.PAY_UPI))
-    if cfg.PAY_CRYPTO:
-        methods.append(("Crypto", cfg.PAY_CRYPTO))
+    for key, label in PAYMENT_LABELS:
+        value = str(settings.get(key, "") or "").strip()
+        if value:
+            methods.append((label, value))
     return methods
 
 
@@ -34,7 +32,7 @@ def methods_text() -> str:
 
 
 def price_text(amount: float) -> str:
-    return money(amount, cfg.CURRENCY)
+    return money(amount, settings.get_str("CURRENCY", "৳") or "৳")
 
 
 def plan_label(plan: dict) -> str:
@@ -70,10 +68,10 @@ def create_order_from_plan(user_id: int, store_id: int, plan: dict, method: str,
     note = f"coupon:{coupon}" if coupon else ""
     order_id = db.create_order(
         user_id=user_id, store_id=store_id, plan=plan, method=method,
-        amount=amount, currency=cfg.CURRENCY, note=note,
+        amount=amount, currency=settings.get_str("CURRENCY", "৳"), note=note,
     )
 
-    if amount <= 0 and cfg.AUTO_APPROVE_ZERO:
+    if amount <= 0 and settings.get_bool("AUTO_APPROVE_ZERO", True):
         approve_order(order_id, admin_id=0, note="auto (free plan)")
         log.info("Order %s auto-approved (free plan) for user %s", order_id, user_id)
 
@@ -106,20 +104,26 @@ def reject_order(order_id: int, admin_id: int, note: str = "") -> dict | None:
     return db.order(order_id)
 
 
+def trial_hours() -> int:
+    """Free trial length, as saved in the panel (0 = trials off)."""
+    return settings.get_int("TRIAL_HOURS", 0)
+
+
 def grant_trial(user_id: int, store: dict) -> bool:
-    """One free trial per user per store (length from TRIAL_HOURS)."""
-    if cfg.TRIAL_HOURS <= 0:
+    """One free trial per user per store (length from the panel setting)."""
+    hours = trial_hours()
+    if hours <= 0:
         return False
     if db.trial_used(user_id, store["id"]):
         return False
     access.grant_access(store["id"], user_id,
-                        time.time() + cfg.TRIAL_HOURS * 3600, source="trial")
+                        time.time() + hours * 3600, source="trial")
     db.mark_trial(user_id, store["id"])
     return True
 
 
 def trial_available(user_id: int, store: dict) -> bool:
-    return cfg.TRIAL_HOURS > 0 and not db.trial_used(user_id, store["id"])
+    return trial_hours() > 0 and not db.trial_used(user_id, store["id"])
 
 
 def apply_coupon(code: str, user_id: int, store: dict, plan: dict | None = None) -> tuple[bool, str]:

@@ -9,7 +9,7 @@ from telethon.tl.functions.channels import GetParticipantRequest
 from app import config as cfg, keyboards, runtime, texts
 from app.logger import log
 from app.runtime import bot
-from app.services import access
+from app.services import access, forcejoin
 from app.services.sender import FLOOD, NO_SESSION, deliver
 from app.services.telegram import safe_call
 from app.storage import db
@@ -75,15 +75,22 @@ async def push_reply_keyboard(event, text: str | None = None):
 
 
 async def notify_join(event, channel: str) -> None:
-    username = channel.replace("https://t.me/", "").replace("@", "").strip("/")
-    buttons = [[Button.url("📢 Join channel", f"https://t.me/{username}")]] if username else None
-    await event.respond(texts.FORCE_JOIN, buttons=buttons)
+    """Ask the user to join — handles @username *and* private invite links."""
+    link = forcejoin.join_url(channel)
+    note = forcejoin.note()
+    text = texts.FORCE_JOIN + (f"\n\n{esc(note)}" if note else "")
+    buttons = [[Button.url("📢 চ্যানেলে জয়েন করুন", link)]] if link else None
+    await event.respond(text, buttons=buttons)
 
 
 async def require_membership(event, user_id: int) -> bool:
     """Force-join gate with a 10 minute cache, so heavy browsing does not
-    hammer GetParticipantRequest (and trip a FloodWait)."""
-    channel = runtime.force_channel()
+    hammer Telegram (and trip a FloodWait).
+
+    Works with @username, a private invite link or a channel id; if membership
+    cannot be verified we let the user through rather than locking them out.
+    """
+    channel = forcejoin.switch()
     if not channel or access.is_admin(user_id):
         return True
     cached = runtime.cached_join(user_id)
@@ -91,19 +98,13 @@ async def require_membership(event, user_id: int) -> bool:
         if not cached:
             await notify_join(event, channel)
         return cached
-    try:
-        await safe_call(bot, GetParticipantRequest(channel=channel, user_id=user_id),
-                        what="force_join", retries=1)
-        runtime.mark_join(user_id, True)
+    result = await forcejoin.is_member(user_id)
+    if result is None:                       # could not check → fail open
         return True
-    except UserNotParticipantError:
-        runtime.mark_join(user_id, False)
+    runtime.mark_join(user_id, result)
+    if not result:
         await notify_join(event, channel)
-        return False
-    except Exception as exc:
-        # Wrong channel name, bot not in the channel, … never lock users out.
-        log.debug("membership check skipped: %s", exc)
-        return True
+    return result
 
 
 async def show_store(event, store: dict, page: int = 0, edit: bool = True):

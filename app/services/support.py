@@ -5,6 +5,7 @@ import time
 
 from app import config as cfg
 from app.logger import log
+from app.services import settings
 from app.runtime import bot
 from app.services.telegram import safe_call
 from app.storage import db
@@ -15,20 +16,17 @@ _last_ticket: dict[int, float] = {}
 
 def support_line() -> str:
     """One line shown to users, e.g. '@myusername · 10:00-22:00'."""
-    parts = []
-    if cfg.SUPPORT_CONTACT:
-        parts.append(cfg.SUPPORT_CONTACT)
-    if cfg.SUPPORT_NOTE:
-        parts.append(cfg.SUPPORT_NOTE)
-    return " · ".join(parts)
+    parts = [settings.get_str("SUPPORT_CONTACT"), settings.get_str("SUPPORT_NOTE")]
+    return " · ".join(part for part in parts if part)
 
 
 def cooldown_left(user_id: int) -> int:
+    cooldown = settings.get_int("TICKET_COOLDOWN", 60)
     last = _last_ticket.get(user_id, 0)
     elapsed = time.time() - last
-    if elapsed >= cfg.TICKET_COOLDOWN:
+    if elapsed >= cooldown:
         return 0
-    return int(cfg.TICKET_COOLDOWN - elapsed)
+    return int(cooldown - elapsed)
 
 
 async def open_ticket(user_id: int, message: str, username: str = "") -> int | None:

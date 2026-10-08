@@ -157,12 +157,16 @@ async def admin_action(event, action: str) -> None:
                         edit=True)
 
     elif action == "settings":
-        await ui.render(event,
-                        "🛠 <b>Settings & Tools</b>\n\n"
-                        "• সেশন কানেক্ট / ডিসকানেক্ট\n"
-                        "• ব্যাকআপ ও ডাটাবেস ডাউনলোড\n"
-                        "• ফোর্স-জয়েন, ক্যাপশন",
-                        keyboards.admin_settings_menu(runtime.is_online(admin_id)), edit=True)
+        from app.services import settings as settings_service
+        rows = [[Button.inline("⚙️ সব সেটিংস (এখানেই বদলান)", "adm:setmenu")]]
+        rows += keyboards.admin_settings_menu(runtime.is_online(admin_id))
+        await ui.render(
+            event,
+            "🛠 <b>সেটিংস ও টুলস</b>\n\n"
+            "💳 পেমেন্ট নাম্বার, 📢 ফোর্স-জয়েন চ্যানেল, 📞 সাপোর্ট কন্টাক্ট, "
+            "📝 ক্যাপশন, 📣 ব্রডকাস্ট গতি — সব <b>⚙️ সব সেটিংস</b> এর ভিতরে।\n"
+            "<i>ওয়েবসাইটের অ্যাডমিন প্যানেল → ⚙️ Settings থেকেও একই জিনিস বদলানো যায়।</i>",
+            rows, edit=True)
 
     elif action == "lang_info":
         await ui.render(event,
@@ -295,12 +299,34 @@ async def admin_action(event, action: str) -> None:
         )
         await send_panel(event, edit=True)
     elif action == "fj":
-        current = runtime.force_channel() or "off"
-        ask(admin_id, "set_channel")
-        await event.respond(f"📢 Current force-join: <b>{esc(current)}</b>\n\n"
-                            "Send the channel username (e.g. <code>@mychannel</code>), "
-                            "or send <code>off</code> to disable.\n\n"
-                            "<i>Tip: @username, t.me/username, or https://t.me/username — সব ফরম্যাট চলবে।</i>")
+        from app.services import forcejoin, settings as settings_service
+        enabled = settings_service.get_bool("FORCE_JOIN_ENABLED", True)
+        ref = settings_service.get_str("FORCE_CHANNEL")
+        link = forcejoin.join_url(ref)
+        lines = [
+            "📢 <b>চ্যানেল জয়েন (Force Join)</b>",
+            "",
+            f" অবস্থা: {'✅ চালু' if enabled and ref else '❌ বন্ধ'}",
+            f" চ্যানেল: <code>{esc(ref or '— সেট করা হয়নি —')}</code>",
+        ]
+        if link:
+            lines.append(f" জয়েন লিংক: <code>{esc(link)}</code>")
+        lines += [
+            "",
+            "<i>যেকোনো কিছু দিতে পারেন: @username, t.me/username, "
+            "প্রাইভেট ইনভাইট লিংক (t.me/+…), এমনকি চ্যানেল আইডি (-100…)</i>",
+        ]
+        rows = [
+            [Button.inline("✏️ চ্যানেল সেট/বদলান", "adm:setk:force_join:FORCE_CHANNEL")],
+            [Button.inline("🔎 চ্যানেল টেস্ট", "fjtest"),
+             Button.inline("🔗 ইনভাইট লিংক", "fjlink")],
+            [Button.inline(f"🔘 জয়েন বাধ্যতামূলক: {'চালু' if enabled else 'বন্ধ'}",
+                           "adm:setk:force_join:FORCE_JOIN_ENABLED")],
+            [Button.inline("📝 জয়েনের সময়ের বার্তা", "adm:setk:force_join:FORCE_JOIN_NOTE")],
+            [Button.inline("🔙 Back", "adm:settings")],
+        ]
+        await ui.render(event, "\n".join(lines), rows, edit=True)
+        await event.answer()
     elif action == "cap":
         current = runtime.caption() or "(empty)"
         ask(admin_id, "set_caption")
@@ -1167,15 +1193,183 @@ async def studio_sizes(event, _rest: str) -> None:
 async def studio_settings(event, _rest: str) -> None:
     if not access.is_admin(event.sender_id):
         return
+    from app.services import settings as settings_service
     text = (
         "⚙️ <b>ব্রডকাস্ট স্পিড সেটিংস</b>\n\n"
-        f"⏱ মেসেজের মাঝে বিরতি: <b>{cfg.BROADCAST_DELAY}s</b>\n"
-        f"🔁 ব্যাচ: <b>{cfg.BROADCAST_BATCH}</b> মেসেজ পরপর → তারপর "
-        f"<b>{cfg.BROADCAST_BATCH_PAUSE}s</b> বিশ্রাম\n"
-        f"🎬 এক মেসেজে সর্বোচ্চ ফাইল: <b>{cfg.BROADCAST_MAX_FILES}</b>\n"
-        f"♻️ রিস্টার্টের পর অটো-রিজিউম: <b>{'চালু' if cfg.BROADCAST_AUTO_RESUME else 'বন্ধ'}</b>\n\n"
-        "<i>এই মানগুলো হোস্টিং প্যানেলের Environment Variables থেকে বদলানো যায় "
-        "(BROADCAST_DELAY, BROADCAST_BATCH, BROADCAST_BATCH_PAUSE)।</i>"
+        f"⏱ মেসেজের মাঝে বিরতি: <b>{settings_service.get_float('BROADCAST_DELAY', 0.35)}s</b>\n"
+        f"🔁 ব্যাচ: <b>{settings_service.get_int('BROADCAST_BATCH', 25)}</b> মেসেজ পরপর → তারপর "
+        f"<b>{settings_service.get_float('BROADCAST_BATCH_PAUSE', 3.0)}s</b> বিশ্রাম\n"
+        f"🎬 এক মেসেজে সর্বোচ্চ ফাইল: <b>{settings_service.get_int('BROADCAST_MAX_FILES', 5)}</b>\n"
+        f"♻️ রিস্টার্টের পর অটো-রিজিউম: "
+        f"<b>{'চালু' if settings_service.get_bool('BROADCAST_AUTO_RESUME', True) else 'বন্ধ'}</b>\n\n"
+        "<i>নিচের বাটন থেকে সরাসরি বদলানো যায় — অথবা ওয়েবসাইটের প্যানেল → Settings → 📣 "
+        "থেকে। Environment Variable-ও আগের মতোই কাজ করবে (ডেটাবেজে সেভ করা মান সেটাকে "
+        "ওভাররাইড করে)।</i>"
     )
-    await ui.render(event, text, [[Button.inline("🔙 Back", "adm:bc")]], edit=True)
+    rows = [[Button.inline("✏️ বিরতি", "adm:setk:broadcast:BROADCAST_DELAY"),
+             Button.inline("✏️ ব্যাচ", "adm:setk:broadcast:BROADCAST_BATCH")],
+            [Button.inline("✏️ লম্বা বিরতি", "adm:setk:broadcast:BROADCAST_BATCH_PAUSE"),
+             Button.inline("✏️ ফাইল", "adm:setk:broadcast:BROADCAST_MAX_FILES")],
+            [Button.inline("🔘 অটো-রিজিউম", "adm:setk:broadcast:BROADCAST_AUTO_RESUME")],
+            [Button.inline("🔙 Back", "adm:bc")]]
+    await ui.render(event, text, rows, edit=True)
+    await event.answer()
+
+
+# ================================================== settings editor (v3.1)
+# একই সেটিংস বট আর ওয়েবসাইট দুই জায়গা থেকেই বদলানো যায় — মান ডেটাবেজে থাকে,
+# তাই বট রিস্টার্টও লাগে না, config.env এডিটও লাগে না। (app/services/settings.py)
+def _setting_value_text(item) -> str:
+    from app.services import settings
+    value = settings.get(item.key)
+    if item.kind == "bool":
+        return "✅ চালু" if value else "❌ বন্ধ"
+    text = str(value or "")
+    if not text:
+        return "<i>— খালি —</i>"
+    if item.kind == "long" and len(text) > 60:
+        text = text[:60] + "…"
+    return f"<code>{esc(text)}</code>"
+
+
+async def show_settings_group(event, group_key: str, edit: bool = True) -> None:
+    from app.services import settings
+    group = next((g for g in settings.all_groups() if g.key == group_key), None)
+    if group is None:
+        await event.answer("সেটিংস গ্রুপটি নেই।", alert=True)
+        return
+    lines = [f"{group.icon} <b>{group.label}</b>"]
+    if group.blurb:
+        lines += ["", f"<i>{group.blurb}</i>"]
+    lines.append("")
+    rows = []
+    for item in group.settings:
+        lines.append(f"• <b>{item.label}</b>: {_setting_value_text(item)}")
+        label = f"✏️ {item.label}"
+        if item.kind == "bool":
+            label = f"🔘 {item.label}"
+        rows.append([Button.inline(label, f"adm:setk:{group.key}:{item.key}")])
+    rows.append([Button.inline("🔙 Back", "adm:setmenu")])
+    await ui.render(event, "\n".join(lines), rows, edit=edit)
+
+
+@route("adm:setmenu")
+async def settings_menu(event, _rest: str) -> None:
+    if not access.is_admin(event.sender_id):
+        return
+    from app.services import settings
+    rows = [[Button.inline(f"{group.icon} {group.label}", f"adm:setg:{group.key}")]
+            for group in settings.all_groups()]
+    rows.append([Button.inline("🌐 ওয়েবসাইট"),
+                 Button.inline("🔙 Back", "adm:settings")])
+    await ui.render(
+        event,
+        "⚙️ <b>সব সেটিংস</b>\n\n"
+        "নিচের সবকিছু এখান থেকে (এবং ওয়েবসাইটের অ্যাডমিন প্যানেল → ⚙️ Settings থেকেও) "
+        "সেট করা যায়। <i>কোনো ফাইল এডিট বা রিস্টার্ট লাগে না।</i>",
+        rows, edit=True,
+    )
+    await event.answer()
+
+
+@route("adm:setg:")
+async def settings_group(event, rest: str) -> None:
+    if not access.is_admin(event.sender_id):
+        return
+    await show_settings_group(event, rest, edit=True)
+    await event.answer()
+
+
+@route("adm:setk:")
+async def setting_edit(event, rest: str) -> None:
+    """Edit one setting: booleans toggle instantly, everything else asks for text."""
+    admin_id = event.sender_id
+    if not access.is_admin(admin_id):
+        return
+    from app.services import settings
+    group_key, _, key = rest.partition(":")
+    item = settings.setting(key)
+    if item is None:
+        await event.answer("সেটিংটি চেনা গেল না।", alert=True)
+        return
+
+    if item.kind == "bool":
+        from app.services import forcejoin
+        current = settings.get_bool(key, bool(item.default))
+        settings.set(key, not current)
+        if key == "FORCE_JOIN_ENABLED":
+            forcejoin.clear_cache()
+        await event.answer("✅ চালু করা হলো" if not current else "❌ বন্ধ করা হলো", alert=True)
+        await show_settings_group(event, item.group, edit=True)
+        return
+
+    ask(admin_id, "setting_edit", group=item.group, key=key)
+    lines = [f"✏️ <b>{item.label}</b>", ""]
+    if item.hint:
+        lines.append(f"<i>{item.hint}</i>")
+    current = str(settings.get(key) or "")
+    if current:
+        lines += ["", f"এখনকার মান: <code>{esc(current)}</code>"]
+    lines += ["", "নতুন মান লিখে পাঠান।", "<i>খালি রাখতে <code>-</code> পাঠান · /cancel বাতিল।</i>"]
+    await ui.render(event, "\n".join(lines),
+                    [[Button.inline("🔙 Back", f"adm:setg:{item.group}")]], edit=True)
+    await event.answer()
+
+
+@route("adm:setrst:")
+async def setting_reset(event, rest: str) -> None:
+    if not access.is_admin(event.sender_id):
+        return
+    from app.services import settings
+    key = rest
+    settings.reset(key)
+    item = settings.setting(key)
+    await event.answer("♻️ ডিফল্টে ফেরানো হলো", alert=True)
+    if item:
+        await show_settings_group(event, item.group, edit=True)
+
+
+@route("fjtest")
+async def force_join_test(event, _rest: str) -> None:
+    admin_id = event.sender_id
+    if not access.is_admin(admin_id):
+        return
+    from app.services import forcejoin
+    result = await forcejoin.resolve(refresh=True, use_cache=False)
+    if result.get("ok"):
+        await event.answer(f"✅ পাওয়া গেছে: {result['title']} ({result['chat_id']})",
+                           alert=True)
+        await ui.render(
+            event,
+            f"✅ <b>চ্যানেল ঠিক আছে</b>\n\n"
+            f"📢 {esc(result['title'])}\n"
+            f"🆔 <code>{result['chat_id']}</code>\n"
+            f"🔗 {esc(forcejoin.join_url()) or '—'}\n"
+            f"<i>পাওয়া গেছে: {esc(result.get('via') or '?')}</i>",
+            [[Button.inline("✏️ বদলান", "adm:setk:force_join:FORCE_CHANNEL"),
+              Button.inline("🔙 Back", "adm:setg:force_join")]], edit=True)
+    else:
+        await ui.render(
+            event,
+            "⚠️ <b>চ্যানেল পাওয়া গেল না</b>\n\n"
+            f"কারণ: <code>{esc(result.get('error') or '?')}</code>\n\n"
+            "<i>টিপস: প্রাইভেট চ্যানেল হলে ইনভাইট লিংক দিন (t.me/+…), আর বট "
+            "(বা একটা সেশন) যেন চ্যানেলে থাকে।</i>",
+            [[Button.inline("✏️ আবার চেষ্টা", "adm:setk:force_join:FORCE_CHANNEL"),
+              Button.inline("🔙 Back", "adm:setg:force_join")]], edit=True)
+    await event.answer()
+
+
+@route("fjlink")
+async def force_join_link(event, _rest: str) -> None:
+    if not access.is_admin(event.sender_id):
+        return
+    from app.services import forcejoin
+    link = await forcejoin.ensure_invite_link()
+    await ui.render(
+        event,
+        (f"🔗 <b>জয়েন করার লিংক</b>\n\n<code>{esc(link)}</code>\n\n"
+         "<i>এই লিংকটাই ইউজাররা দেখবে।</i>" if link else
+         "⚠️ লিংক বানানো গেল না — চ্যানেল সেট করুন, অথবা সরাসরি ইনভাইট লিংক বসান।"),
+        [[Button.inline("🔙 Back", "adm:setg:force_join")]], edit=True)
     await event.answer()

@@ -29,6 +29,7 @@ from telethon.errors import FloodWaitError
 from app import config as cfg
 from app.logger import log
 from app.runtime import blocked_users, bot, spawn
+from app.services import settings
 from app.services.telegram import safe_call
 from app.storage import db
 
@@ -150,13 +151,14 @@ async def _send_to_user(campaign: dict, user_id: int) -> None:
 
         user = db.user(user_id) or {}
         body = personalize(text, user.get("name") or "", user.get("username") or "")
-        for index, file_id in enumerate(file_ids[: cfg.BROADCAST_MAX_FILES]):
+        max_files = settings.get_int("BROADCAST_MAX_FILES", 5)
+        for index, file_id in enumerate(file_ids[:max_files]):
             result = await deliver_file_id(user_id, file_id,
                                            body if index == 0 else (runtime_caption() or ""))
             if not result.ok:
                 raise RuntimeError(f"file {file_id}: {result.reason}")
-            if index + 1 < min(len(file_ids), cfg.BROADCAST_MAX_FILES):
-                await asyncio.sleep(cfg.BROADCAST_MEDIA_DELAY)
+            if index + 1 < min(len(file_ids), max_files):
+                await asyncio.sleep(settings.get_float("BROADCAST_MEDIA_DELAY", 1.0))
         return
 
     if not text:
@@ -182,11 +184,13 @@ def _classify(exc: Exception) -> str:
 
 
 async def _pause(campaign_id: int, index: int) -> bool:
-    """Pacing between messages. Returns False when the campaign was cancelled."""
-    await asyncio.sleep(cfg.BROADCAST_DELAY)
-    if cfg.BROADCAST_BATCH and index % cfg.BROADCAST_BATCH == 0:
+    """Pacing between messages (speeds are panel settings). Returns False when
+    the campaign was cancelled."""
+    await asyncio.sleep(settings.get_float("BROADCAST_DELAY", 0.35))
+    batch = settings.get_int("BROADCAST_BATCH", 25)
+    if batch and index % batch == 0:
         log.info("Campaign #%s: pause after %s messages", campaign_id, index)
-        await asyncio.sleep(cfg.BROADCAST_BATCH_PAUSE)
+        await asyncio.sleep(settings.get_float("BROADCAST_BATCH_PAUSE", 3.0))
     return not is_cancelled(campaign_id)
 
 
@@ -376,7 +380,7 @@ async def run_broadcast(targets: list[int], text: str,
     active = [uid for uid in targets if uid not in blocked_users]
     skipped = total - len(active)
     started = time.time()
-    pause = delay if delay is not None else cfg.BROADCAST_DELAY
+    pause = delay if delay is not None else settings.get_float("BROADCAST_DELAY", 0.35)
 
     for index, user_id in enumerate(active, start=1):
         try:

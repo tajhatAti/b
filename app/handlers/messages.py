@@ -36,6 +36,7 @@ USER_ACTIONS = {
     "ban_user",            # ban
     "unban_user",          # unban
     "set_welcome",         # welcome message
+    "setting_edit",        # ব্যানেল/ওয়েবসাইট থেকে সেটিং বদলানো (অ্যাডমিন)
 }
 KIND_MAP = (("video", "Video"), ("photo", "Photo"), ("audio", "Audio"),
             ("document", "Document"), ("voice", "Audio"))
@@ -246,41 +247,43 @@ async def pending_input(event) -> None:
         return
 
     if action == "set_channel":
-        # Normalize channel input: @username, t.me/username, https://t.me/username → @username
+        from app.services import forcejoin, settings as settings_service
         raw = text.strip()
-        if raw.lower() in ("off", "no", "none", "-", "clear", "disable"):
-            new_val = ""
+        if raw.lower() in ("off", "none", "no", "disable", "বন্ধ", "-"):
+            settings_service.set("FORCE_CHANNEL", "")
+            settings_service.set("FORCE_JOIN_ENABLED", False)
+            forcejoin.clear_cache()
+            await answer("✅ ফোর্স-জয়েন বন্ধ করা হলো — সবাই সরাসরি ব্রাউজ করতে পারবে।")
         else:
-            # Extract username from various formats
-            candidate = raw
-            # Remove URL prefix
-            for prefix in ("https://t.me/", "http://t.me/", "t.me/", "@"):
-                if candidate.lower().startswith(prefix.lower()):
-                    candidate = candidate[len(prefix):].lstrip("/")
-                    break
-            candidate = candidate.split("/")[0].split("?")[0].strip()
-            if candidate and not candidate.startswith("@"):
-                candidate = "@" + candidate
-            new_val = candidate if candidate != "@" else ""
-        runtime.set_force_channel(new_val)
-        # Clear cached membership checks so new channel takes effect immediately
+            cleaned = forcejoin.normalize(raw)
+            if not cleaned:
+                await answer("⚠️ <b>চ্যানেল চেনা গেল না।</b>\n"
+                             "যেকোনো একটা দিন: <code>@mychannel</code>, "
+                             "<code>https://t.me/mychannel</code>, "
+                             "<code>https://t.me/+ইনভাইট</code>, অথবা চ্যানেল আইডি "
+                             "<code>-100…</code>")
+            else:
+                ok, error = settings_service.set("FORCE_CHANNEL", cleaned)
+                if not ok:
+                    await answer(f"⚠️ {esc(error)}")
+                else:
+                    settings_service.set("FORCE_JOIN_ENABLED", True)
+                    forcejoin.clear_cache()
+                    result = await forcejoin.resolve(refresh=True, use_cache=False)
+                    if result.get("ok"):
+                        await answer(f"✅ চ্যানেল সেট: <b>{esc(result['title'])}</b>\n"
+                                     f"🔗 {esc(forcejoin.join_url()) or '—'}")
+                    else:
+                        target = forcejoin.parse(cleaned)
+                        extra = ("" if target["kind"] != "invite" else
+                                 "\nপ্রাইভেট লিংক সংরক্ষণ করা হয়েছে; বট চ্যানেলে "
+                                 "অ্যাড থাকলে চেক কাজ করবে।")
+                        await answer(f"⚠️ সেভ হয়েছে: <code>{esc(cleaned)}</code>\n"
+                                     f"তবে চ্যানেল পাওয়া যায়নি ({esc(result.get('error') or '')})."
+                                     f"{extra}")
         try:
-            runtime.force_join_cache.clear()
-            runtime.force_join_ok.clear()
-        except Exception:
-            pass
-        if new_val:
-            await answer(
-                f"✅ Force-join updated to <b>{esc(new_val)}</b>.\n\n"
-                "⚠️ Make sure this bot is an <b>admin</b> in that channel, otherwise users won't be blocked.\n"
-                "Test with a second account — if the bot can't check membership, it will let everyone through to avoid locking you out."
-            )
-        else:
-            await answer("✅ Force-join disabled — everyone can browse without joining.")
-        # Return to growth/settings menu
-        try:
-            from app.handlers.admin import send_panel
-            await send_panel(event, edit=False)
+            from app.handlers.admin import show_settings_group
+            await show_settings_group(event, "force_join", edit=False)
         except Exception:
             pass
         return
@@ -821,6 +824,37 @@ async def pending_input(event) -> None:
             await send_panel(event, edit=False)
         except Exception:
             pass
+        return
+
+    # --------------------------------------------------------- setting editor
+    if action == "setting_edit":
+        from app.services import settings as settings_service
+        key = ctx.get("key") or ""
+        item = settings_service.setting(key)
+        if item is None:
+            await answer("⚠️ সেটিংটি চেনা গেল না।")
+            return
+        value = text.strip()
+        if value in ("-", "clear", "খালি", "empty"):
+            value = ""
+        ok, error = settings_service.set(key, value)
+        if not ok:
+            ask(admin_id, "setting_edit", **ctx)
+            await answer(f"⚠️ {esc(error)}")
+            return
+        if key == "FORCE_CHANNEL":
+            from app.services import forcejoin
+            forcejoin.clear_cache()
+            if value:
+                settings_service.set("FORCE_JOIN_ENABLED", True)
+                result = await forcejoin.resolve(refresh=True, use_cache=False)
+                await answer(f"✅ সেভ হয়েছে। চ্যানেল: {esc(result.get('title') or '— পাওয়া যায়নি —')}")
+            else:
+                await answer("✅ ফোর্স-জয়েন বন্ধ করা হলো।")
+        else:
+            await answer("✅ সেভ হয়েছে — সাথে সাথেই কার্যকর।")
+        from app.handlers.admin import show_settings_group
+        await show_settings_group(event, item.group, edit=False)
         return
 
     # ------------------------------------------------------ broadcast studio

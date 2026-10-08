@@ -5,11 +5,12 @@ import time
 
 from telethon.tl.custom import Button
 
-from app import config as cfg, i18n, ui
+from app import i18n, ui
 from app.handlers.router import route
 from app.handlers.state import ask, end_flow, flow as remember, ctx as flow_ctx
 from app.runtime import bot
-from app.services import access, billing
+from app import config as cfg
+from app.services import access, billing, settings
 from app.services.telegram import safe_call
 from app.storage import db
 from app.utils import esc, fmt_ts, safe_int
@@ -34,7 +35,7 @@ def paywall_buttons(event, store: dict, user_id: int) -> list[list[Button]]:
     # Trial if available
     if billing.trial_available(user_id, store):
         rows.append([Button.inline(
-            i18n.t(user_id, "trial_button", h=cfg.TRIAL_HOURS), f"bt:{store['id']}")])
+            i18n.t(user_id, "trial_button", h=billing.trial_hours()), f"bt:{store['id']}")])
 
     # Contact admin — inline, direct
     contact_label = i18n.t(user_id, "contact_button")
@@ -148,9 +149,10 @@ async def plan_detail(event, rest: str) -> None:
         "💰 <b>পেমেন্ট করুন এই নাম্বারে:</b>",
         methods,
     ]
-    if cfg.PAY_NOTE:
+    pay_note = settings.get_str("PAY_NOTE")
+    if pay_note:
         lines.append("")
-        lines.append(f"📝 {esc(cfg.PAY_NOTE)}")
+        lines.append(f"📝 {esc(pay_note)}")
     if percent:
         lines.insert(0, f"🎟️ কুপন <code>{esc(coupon_code)}</code> — <b>{percent}% ছাড়</b> প্রয়োগ হয়েছে!")
         lines.insert(1, f"আগের দাম: <s>{billing.price_text(plan['price'])}</s> → এখন: <b>{billing.price_text(price)}</b>")
@@ -229,7 +231,8 @@ async def start_trial(event, rest: str) -> None:
     if not billing.grant_trial(user_id, store):
         await event.answer(i18n.t(user_id, "trial_used"), alert=True)
         return
-    await event.answer(i18n.t(user_id, "trial_granted", h=cfg.TRIAL_HOURS), alert=True)
+    await event.answer(i18n.t(user_id, "trial_granted", h=billing.trial_hours()),
+                       alert=True)
     await ui.show_store(event, store, 0, edit=True)
 
 
@@ -550,9 +553,9 @@ async def payment_settings(event, rest: str) -> None:
     if not access.is_admin(admin_id):
         return
     lines = [
-        "💳 <b>Payment settings</b>",
+        "💳 <b>পেমেন্ট সেটিংস</b>",
         "",
-        f"Currency: <b>{esc(cfg.CURRENCY)}</b>",
+        f"মুদ্রা: <b>{esc(settings.get_str('CURRENCY', '৳'))}</b>",
     ]
     methods = billing.payment_methods()
     if methods:
@@ -561,18 +564,23 @@ async def payment_settings(event, rest: str) -> None:
         lines.append("<i>No payment numbers configured yet.</i>")
     lines.extend([
         "",
-        "এই নাম্বারগুলো <code>config.env</code> ফাইলে সেট করতে হয় ",
-        "(হোস্টিং প্যানেলের Environment ভেরিয়েবলেও দেওয়া যায়):",
-        "<code>PAY_BKASH=01712-345678</code>",
-        "<code>PAY_NAGAD=01712-345678</code>",
-        "<code>PAY_ROCKET=01712-345678</code>",
-        "<code>PAY_UPI=yourname@upi</code>",
-        "<code>PAY_CRYPTO=USDT-TRC20 address</code>",
-        "<code>CURRENCY=৳</code>",
-        "",
-        "<i>ফাইল এডিট করার পর বট রিস্টার্ট করুন।</i>",
+        "✏️ নিচের বাটনে চাপ দিয়ে নাম্বার যোগ/বদল করতে পারবেন — অথবা "
+        "<b>ওয়েবসাইটের অ্যাডমিন প্যানেল → ⚙️ Settings → 💳 পেমেন্ট</b> থেকেও।",
+        "<i>বট রিস্টার্ট করার দরকার নেই, সাথে সাথেই কার্যকর হয়।</i>",
     ])
-    await ui.render(event, "\n".join(lines), [[Button.inline("🔙 Back to panel", "adm:back")]], edit=True)
+    rows = [[Button.inline(f"{'✅' if settings.get(k) else '➕'} {label}",
+                           f"pme:{key}") for key, label in (("PAY_BKASH", "bKash"),
+                                                            ("PAY_NAGAD", "Nagad"))],
+            [Button.inline(f"{'✅' if settings.get(k) else '➕'} {label}",
+                           f"pme:{key}") for key, label in (("PAY_ROCKET", "Rocket"),
+                                                            ("PAY_UPI", "UPI"))],
+            [Button.inline(f"{'✅' if settings.get(k) else '➕'} Crypto", "pme:PAY_CRYPTO")],
+            [Button.inline("📝 পেমেন্ট নির্দেশনা", "pme:PAY_NOTE"),
+             Button.inline("🪙 মুদ্রা", "pme:CURRENCY")],
+            [Button.inline("🎁 ট্রায়াল ঘণ্টা", "pme:TRIAL_HOURS"),
+             Button.inline("🌐 ওয়েবসাইটে সেটিংস", "adm:settings")],
+            [Button.inline("🔙 Back to panel", "adm:back")]]
+    await ui.render(event, "\n".join(lines), rows, edit=True)
     await event.answer()
 
 
@@ -617,8 +625,19 @@ async def close_ticket(event, rest: str) -> None:
     if not access.is_admin(admin_id):
         return
     ticket_id = safe_int(rest)
+    ticket = db.ticket(ticket_id)
     db.close_ticket(ticket_id)
-    await event.answer("✅ Ticket closed.", alert=True)
+    await event.answer("✅ টিকেট বন্ধ করা হলো", alert=True)
+    # ইউজারকে জানিয়ে দেওয়া — আগে সে বুঝতেই পারত না যে উত্তর আসবে না
+    if ticket and ticket.get("user_id"):
+        try:
+            await bot.send_message(
+                ticket["user_id"],
+                "📮 <b>আপনার টিকেট #" + str(ticket_id) + " বন্ধ করা হয়েছে।</b>\n"
+                "আবার কিছু জানতে চাইলে শুধু মেসেজ লিখে দিন — আমরা সবসময় আছি।",
+            )
+        except Exception:
+            pass
 
 
 @route("supq")
@@ -705,3 +724,13 @@ async def winback_send(event, rest: str) -> None:
     status = await event.respond(f"📢 Sending win-back offer to {len(targets)} user(s)…")
     from app.handlers.messages import run_broadcast
     await run_broadcast(admin_id, targets, text, status)
+
+
+@route("pme:")
+async def payment_edit(event, rest: str) -> None:
+    """পেমেন্ট নাম্বার/মুদ্রা/ট্রায়াল — সব সরাসরি বট থেকেই বদলানো যায়."""
+    admin_id = event.sender_id
+    if not access.is_admin(admin_id):
+        return
+    from app.handlers.admin import setting_edit
+    await setting_edit(event, f"payments:{rest}")

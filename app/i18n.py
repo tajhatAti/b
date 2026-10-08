@@ -7,7 +7,7 @@ switch with the 🌐 button, and their choice is stored in the database.
 """
 from __future__ import annotations
 
-from app import config as cfg
+from app.services import settings
 from app.storage import db
 
 STRINGS: dict[str, dict[str, str]] = {
@@ -121,7 +121,7 @@ ADMIN_STRINGS = {
 
 
 def lang_of(user_id: int) -> str:
-    lang = db.user_lang(user_id) or cfg.DEFAULT_LANG
+    lang = db.user_lang(user_id) or settings.get_str("DEFAULT_LANG", "bn")
     return lang if lang in ("bn", "en") else "bn"
 
 
