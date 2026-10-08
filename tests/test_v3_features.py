@@ -704,3 +704,94 @@ async def test_limited_link_click_refuses_after_the_limit(bot_state, monkeypatch
     assert "লিমিট" in collected_sends[-1][1]
     assert recorded_deliveries == [(USER_ID, file_id)]          # nothing more sent
     assert db.events(name="limit_block", user_id=USER_ID)
+
+
+# ============================================ uploads: the “text keeps saving” bug
+@pytest.mark.asyncio
+async def test_admin_text_message_is_never_saved(bot_state, monkeypatch):
+    """A text (or link-preview) message must not create a store item."""
+    from app.handlers import messages as messages_module
+    from tests.test_flows import FakeEvent
+    store, _file_id = _store_with_video()
+    db.set_active_store(ADMIN_ID, store["id"])
+    before = len(db.files_of(store["id"]))
+
+    event = FakeEvent(ADMIN_ID, text="https://example.com/whatever")
+    event.media = object()                       # Telegram sets .media for link previews
+    event.message = SimpleNamespace(id=91, media=event.media, message="", file=None,
+                                    video=None, photo=None, audio=None, voice=None,
+                                    document=None, sticker=None, gif=None, poll=None,
+                                    geo=None, contact=None)
+    event.message.media = SimpleNamespace(webpage=object())
+    await messages_module.media_upload(event)
+
+    assert len(db.files_of(store["id"])) == before        # nothing saved
+    assert any("সেভ হয় না" in (text or "") for text, _ in event.sent)
+
+
+@pytest.mark.asyncio
+async def test_admin_video_message_is_saved_once(bot_state, monkeypatch):
+    from app.handlers import messages as messages_module
+    from tests.test_flows import FakeEvent
+    store, _file_id = _store_with_video()
+    db.set_active_store(ADMIN_ID, store["id"])
+    before = len(db.files_of(store["id"]))
+
+    async def no_mirror(file_id):
+        return None
+    monkeypatch.setattr(messages_module, "spawn", lambda coro: coro.close())
+
+    event = FakeEvent(ADMIN_ID)
+    event.media = object()
+    event.message = SimpleNamespace(
+        id=123, message="Episode 9 HD", file=SimpleNamespace(size=555),
+        video=SimpleNamespace(duration=120), photo=None, audio=None, voice=None,
+        document=None, sticker=None, gif=None, poll=None, geo=None, contact=None,
+    )
+    event.message.media = SimpleNamespace(document=object())
+    await messages_module.media_upload(event)
+    files = db.files_of(store["id"])
+    assert len(files) == before + 1
+    assert files[-1]["name"] == "Episode 9 HD" and files[-1]["kind"] == "Video"
+
+    # sending the very same message again must not duplicate it
+    await messages_module.media_upload(event)
+    assert len(db.files_of(store["id"])) == before + 1
+
+
+@pytest.mark.asyncio
+async def test_scanner_ignores_audio_and_documents(clean):
+    from app.services import scanner
+    store, _file_id = _store_with_video()
+    audio = FakeMessage(audio=True)
+    document = FakeMessage(document=True)
+    video = _video_message("Scan me")
+    assert scanner._kind_of(audio) is None
+    assert scanner._kind_of(document) is None
+    assert scanner._kind_of(video) == "Video"
+
+
+@pytest.mark.asyncio
+async def test_store_open_is_gated_and_logged(clean, monkeypatch, collected_sends):
+    store, file_id = _store_with_video()
+    db.set_store_forcejoin(store["id"], "@scoped")
+
+    async def missing(user_id, store_id=None):
+        return {"ok": False, "checked": 1, "skipped": 0,
+                "missing": [{"ref": "@scoped", "title": "Scoped",
+                             "invite": "https://t.me/scoped", "id": 0}]}
+
+    monkeypatch.setattr(forcejoin, "check_many", missing)
+    event = GateEvent(USER_ID)
+    await flow.open_store(event, store["id"])
+    assert collected_sends and "জয়েন" in collected_sends[-1][1]
+    assert db.events(name="open_store", user_id=USER_ID)
+    assert db.events(name="join_block", user_id=USER_ID)
+
+
+def test_gate_text_escapes_channel_titles_but_keeps_html():
+    text = forcejoin.gate_text([{"title": "A <b>bad</b> title", "ref": "@x"}])
+    assert "<b>ফাইলটি পেতে আগে চ্যানেল জয়েন করুন</b>" in text   # our own markup kept
+    assert "&lt;b&gt;bad&lt;/b&gt;" in text                       # user data escaped
+    again = forcejoin.gate_text([{"title": "T", "ref": "@x"}], "again")
+    assert "এখনো জয়েন করেননি" in again

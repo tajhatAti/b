@@ -458,7 +458,7 @@ async def self_test() -> list[dict]:
     sessions = db.all_sessions()
     online = sum(1 for row in sessions if row["admin_id"] in runtime.user_clients)
     add("ইউজারবট সেশন", online > 0 or not sessions,
-        f"{online}/{len(sessions)} কানেক্টেড" if sessions else "কোনো সেশন নেই (উpload করা ফাইল 직접 পাঠানো যাবে)")
+        f"{online}/{len(sessions)} কানেক্টেড" if sessions else "কোনো সেশন নেই — আপলোড করা ফাইল বট নিজেই পাঠাতে পারে")
 
     cache = media_cache.stats()
     add("মিডিয়া ক্যাশ", cache["missing"] == 0,
@@ -474,6 +474,13 @@ async def self_test() -> list[dict]:
     add("ব্রডকাস্ট কিউ", True, f"{len(running)} চলমান · মোট {len(db.campaigns(limit=200))} ক্যাম্পেইন")
     add("ফোর্স-জয়েন", True,
         f"{len(forcejoin.targets())} চ্যানেল সেট" if forcejoin.targets() else "বন্ধ (কেউ আটকাবে না)")
+    stores = db.all_stores()
+    add("স্টোর লিস্ট", bool(stores), f"{len(stores)} টি স্টোর সাইটে দেখা যাবে"
+        if stores else "এখনো কোনো স্টোর নেই — প্রথমেই একটা স্টোর বানান")
+    slugged = [s for s in stores if (s.get("slug") or "").strip()]
+    add("স্টোর ডিপ-লিংক", len(slugged) == len(stores) and bool(runtime.bot_username),
+        f"{len(slugged)}/{len(stores)} স্টোরের slug ঠিক আছে"
+        + ("" if runtime.bot_username else " · বট ইউজারনেম এখনো পাওয়া যায়নি"))
     add("টেলিগ্রামের চাপ", not bool(flood_status()), flood_status() or "স্বাভাবিক")
     add("ওয়েব লগইন", bool(cfg.WEB_PASS), "WEB_PASS সেট আছে" if cfg.WEB_PASS else "পাসওয়ার্ড নেই (হোস্টে সেট করুন)")
     return checks

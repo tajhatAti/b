@@ -71,7 +71,7 @@ async def show_join_gate(event, user_id: int, file_row: dict, missing: list[dict
     if file_id:
         db.join_prompt_set(user_id, file_id, token or "")
     log("join_block", user_id, store_id, file_id, token)
-    text = esc(forcejoin.gate_text(missing, "again" if again else "fresh"))
+    text = forcejoin.gate_text(missing, "again" if again else "fresh")
     buttons = forcejoin.gate_keyboard(user_id, file_id, missing, token)
     target = chat_id if chat_id is not None else event.chat_id
     return await sender.send_text(target, text, buttons=buttons)

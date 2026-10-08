@@ -415,9 +415,13 @@ def gate_keyboard(user_id: int, file_id: int, missing: list[dict], token: str = 
 
 
 def gate_text(missing: list[dict], variant: str = "fresh") -> str:
-    channels = "\n".join(f"  • {t.get('title') or t.get('ref')}" for t in missing[:6])
-    extra = note()
-    tail = f"\n\n{extra}" if extra else ""
+    """HTML for the gate message. Channel titles come from Telegram, so they are
+    escaped here — and the caller must therefore NOT escape the whole string."""
+    from app.utils import esc
+    channels = "\n".join(f"  • {esc(t.get('title') or t.get('ref') or '')}"
+                         for t in missing[:6])
+    extra = esc(note()) if note() else ""
+    tail = f"\n\n<i>{extra}</i>" if extra else ""
     if variant == "again":
         return ("⛔️ এখনো জয়েন করেননি!\n\n"
                 f"নিচের চ্যানেল{'গুলো' if len(missing) > 1 else ''} জয়েন করে আবার "
