@@ -710,7 +710,7 @@ def create_app() -> FastAPI:
           const bar = document.querySelector('.bar > i');
           async function tick() {{
             try {{
-              const r = await fetch('/admin/api/campaign/{campaign_id}');
+              const r = await fetch('admin/api/campaign/{campaign_id}');
               const d = await r.json();
               if (bar) bar.style.width = d.percent + '%';
               document.querySelectorAll('.card .n')[1].textContent = d.total;

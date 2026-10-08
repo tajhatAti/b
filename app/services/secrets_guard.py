@@ -123,6 +123,79 @@ def scan_repo(repo_dir: Path | None = None, limit: int = 25) -> list[dict]:
     return findings
 
 
+#: archive members we are willing to read (a zip inside a public repo hides a
+#: leaked token just as well as a `.py` file — the owner uploaded one already)
+ARCHIVE_TEXT_SUFFIXES = (".py", ".txt", ".json", ".env", ".md", ".cfg", ".ini", ".yaml",
+                        ".yml", ".js", ".ts", ".sh", ".example")
+ARCHIVE_MAX_MEMBER = 256 * 1024          # bigger members are not a config file
+ARCHIVE_MAX_TOTAL = 4 * 1024 * 1024      # never read a whole distribution
+
+
+def _looks_like_archive(data: bytes) -> bool:
+    return data[:2] == b"PK" or data[:4] == b"PK\x03\x04"
+
+
+def scan_archives(repo_dir: Path | None = None, limit: int = 10) -> list[dict]:
+    """Scan *tracked* zip files — a leaked token hidden inside one still counts.
+
+    Returns the same shape as :func:`scan_repo`, with the member appended to the
+    file name as ``archive.zip!inner/file.py``, so the security page can show
+    exactly where the value lives.
+    """
+    import subprocess as _sp
+    import zipfile
+
+    repo = Path(repo_dir or Path(cfg.BASE_DIR))
+    findings: list[dict] = []
+    try:
+        listed = _sp.run(  # noqa: S603 - fixed argv, no shell
+            ["git", "-C", str(repo), "ls-files", "-z"],
+            capture_output=True, timeout=20, check=False,
+        )
+    except (OSError, _sp.SubprocessError):
+        return findings
+    for raw in listed.stdout.split(b"\x00"):
+        name = raw.decode("utf-8", errors="ignore").strip()
+        if not name or _skip(name):
+            continue
+        path = repo / name
+        try:
+            if not path.is_file() or path.stat().st_size > ARCHIVE_MAX_TOTAL:
+                continue
+            with open(path, "rb") as handle:
+                if not _looks_like_archive(handle.read(4)):
+                    continue
+            with zipfile.ZipFile(path) as archive:
+                for member in archive.infolist():
+                    if member.is_dir() or member.file_size > ARCHIVE_MAX_MEMBER:
+                        continue
+                    if not (member.filename.endswith(ARCHIVE_TEXT_SUFFIXES)
+                            or "." not in Path(member.filename).name):
+                        continue
+                    try:
+                        text = archive.read(member).decode("utf-8", errors="ignore")
+                    except (KeyError, OSError, RuntimeError):
+                        continue
+                    for number, line in enumerate(text.splitlines(), 1):
+                        for pattern in PATTERNS:
+                            found = re.search(pattern, line)
+                            if not found:
+                                continue
+                            value = (found.group(found.lastindex) if found.lastindex
+                                     else found.group(0))
+                            if not looks_real(value):
+                                continue
+                            findings.append({"file": f"{name}!{member.filename}",
+                                             "line": number, "preview": _mask(value),
+                                             "committed": True})
+                            break
+                        if len(findings) >= limit:
+                            return findings
+        except (OSError, ValueError, zipfile.BadZipFile):
+            continue
+    return findings
+
+
 def _git_tracked(repo_dir: Path, name: str) -> bool | None:
     """True/False when we can ask git, None when git (or the repo) is absent."""
     try:
@@ -183,6 +256,11 @@ def audit(repo_dir: Path | None = None, env_file: Path | None = None) -> dict:
     env_name = env_file.name
     repo_files = [row for row in scan_repo(repo_dir) if Path(row["file"]).name != env_name] \
         if tracked is not None else []
+    if tracked is not None:
+        # zips hide text files just fine — `website-model-info` in this very repo
+        # is a zip holding a hard-coded API_HASH.
+        repo_files += [row for row in scan_archives(repo_dir)
+                       if Path(row["file"].split("!")[0]).name != env_name]
     return {
         "tracked": bool(tracked),
         "git_available": tracked is not None,

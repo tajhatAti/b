@@ -278,6 +278,51 @@ def test_secrets_guard_flags_a_committed_env_file(tmp_path):
     assert secrets_guard.warning_lines(report)
 
 
+def test_secrets_guard_looks_inside_a_zip(tmp_path):
+    """A leaked token zipped up is still a leaked token (the owner uploaded one)."""
+    import subprocess
+    import zipfile
+
+    from app.services import secrets_guard
+
+    repo = tmp_path / "repo"
+    (repo / "inner").mkdir(parents=True)
+    (repo / "inner" / "core.py").write_text(
+        'API_ID = 37109385\nAPI_HASH = "deadbeefdeadbeefdeadbeefdeadbeef"\n'
+        'BOT_TOKEN = "1234567890:AAH-not-a-real-token-but-long-enough"\n',
+        encoding="utf-8",
+    )
+    (repo / "notes.png").write_bytes(b"\x89PNG\r\n\x1a\nnot an archive")
+    with zipfile.ZipFile(repo / "website-model-info", "w") as archive:
+        archive.write(repo / "inner" / "core.py", "group_moderator/core.py")
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "website-model-info", "notes.png"], cwd=repo, check=True)
+
+    found = secrets_guard.scan_archives(repo)
+    assert found, "the zip member's API_HASH was not detected"
+    assert all(row["file"].startswith("website-model-info!") for row in found)
+    assert all(row["committed"] for row in found)
+    assert all("deadbeef" not in row["preview"] for row in found)   # masked
+
+    report = secrets_guard.audit(repo_dir=repo, env_file=repo / "config.env")
+    assert any("website-model-info" in row["file"] for row in report["repo_files"])
+    assert any("website-model-info" in line for line in secrets_guard.warning_lines(report))
+
+
+def test_secrets_guard_ignores_plain_binaries(tmp_path):
+    """Only real zip archives are opened — a random binary is not parsed."""
+    import subprocess
+
+    from app.services import secrets_guard
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "blob.bin").write_bytes(b"\x00\x01\x02API_HASH=deadbeefdeadbeefdeadbeefdeadbeef")
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "blob.bin"], cwd=repo, check=True)
+    assert secrets_guard.scan_archives(repo) == []
+
+
 def test_secrets_guard_is_quiet_when_env_is_untracked(tmp_path):
     from app.services import secrets_guard
 

@@ -32,7 +32,17 @@ import re
 #: the current request's prefix ("" when the app is served from the domain root)
 _prefix: contextvars.ContextVar[str] = contextvars.ContextVar("base_prefix", default="")
 
-_ATTR = re.compile(r'(?P<attr>\b(?:href|action|src)=)"/(?!/)')
+#: ``href="/admin"``, ``href='/admin'`` and the unquoted ``action=/admin`` alike
+_ATTR = re.compile(
+    r'(?P<attr>\b(?:href|action|src|poster|data-url|formaction)=)'
+    r'(?P<quote>["\']?)/(?!/)')
+#: literal URLs inside JavaScript — ``fetch('/admin/api/…')`` must not jump to
+#: the panel root either, and `<base>` does not help for these.
+_JS = re.compile(
+    r'(?P<head>(?:\bfetch|\bopen)\s*\(\s*|'
+    r'\blocation\.(?:href|assign|replace)\s*=\s*|'
+    r'\b(?:window|document)\.location\s*=\s*)'
+    r'(?P<quote>["\'])/(?!/)')
 
 
 def normalize(value: str | None) -> str:
@@ -63,5 +73,11 @@ def url(path: str = "/") -> str:
 
 
 def relativize(html: str) -> str:
-    """Make root-absolute links base-relative (pairs with ``<base href>``)."""
-    return _ATTR.sub(lambda m: f'{m.group("attr")}"', html)
+    """Make root-absolute links base-relative (pairs with ``<base href>``).
+
+    Handles the three shapes that actually appear in the templates: quoted
+    attributes in both quote styles, unquoted ones, and literal ``fetch('/…')``
+    / ``location.href = '/…'`` strings inside the page's JavaScript.
+    """
+    html = _ATTR.sub(lambda m: f'{m.group("attr")}{m.group("quote")}', html)
+    return _JS.sub(lambda m: f'{m.group("head")}{m.group("quote")}', html)

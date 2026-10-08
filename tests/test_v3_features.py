@@ -1293,12 +1293,24 @@ def test_the_panel_prefix_is_normalized_safely():
 def test_links_stay_inside_the_panel_prefix():
     from app.services import basepath
 
-    html = '<a href="/admin/files">f</a><form action="/admin/login"></form>'
+    html = ('<a href="/admin/files">f</a><a href=\'/admin/users\'>u</a>'
+            '<form action="/admin/login"></form><form action=/admin/save></form>'
+            '<img src="//cdn.example/p.png"><a href="https://x/y">out</a>'
+            "<script>fetch('/admin/api/campaign/7'); location.href='/help';"
+            "const path = '/admin/untouched';</script>")
     basepath.set_prefix("/live/job1")
     try:
         out = basepath.relativize(html)
-        assert 'href="admin/files"' in out
+        assert 'href="admin/files"' in out           # double quotes
+        assert "href='admin/users'" in out           # single quotes
         assert 'action="admin/login"' in out
+        assert 'action=admin/save' in out            # unquoted
+        assert "fetch('admin/api/campaign/7')" in out
+        assert "location.href='help'" in out
+        # external links, protocol-relative assets and non-URL strings are kept
+        assert 'src="//cdn.example/p.png"' in out
+        assert 'href="https://x/y"' in out
+        assert "const path = '/admin/untouched'" in out
         assert basepath.url("/health") == "/live/job1/health"
     finally:
         basepath.set_prefix("")
