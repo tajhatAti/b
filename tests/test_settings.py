@@ -288,3 +288,26 @@ def test_secrets_guard_is_quiet_when_env_is_untracked(tmp_path):
     report = secrets_guard.audit(repo_dir=repo, env_file=repo / "config.env")
     assert report["tracked"] is False
     assert secrets_guard.warning_lines(report) == []
+
+
+def test_run_entrypoint_starts_both_workers(tmp_path, monkeypatch):
+    """`python run.py` must never die because of the watchdog/import typo class of bug."""
+    import importlib
+
+    run_module = importlib.import_module("run")
+    assert hasattr(run_module, "secrets_watchdog")
+    assert hasattr(run_module, "web_worker")
+    assert hasattr(run_module, "bot_worker")
+    assert hasattr(run_module, "secrets_guard")
+
+
+@pytest.mark.asyncio
+async def test_secrets_watchdog_never_raises(monkeypatch):
+    import run as run_module
+    from app.services import secrets_guard
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("git exploded")
+
+    monkeypatch.setattr(secrets_guard, "log_report", boom)
+    await run_module.secrets_watchdog()          # must swallow and move on

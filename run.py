@@ -25,6 +25,7 @@ from telethon import TelegramClient
 
 from app import config as cfg, runtime
 from app.logger import log, setup_logging
+from app.services import secrets_guard
 from app.storage import db
 
 HANDLER_MODULES = ("app.handlers.admin", "app.handlers.billing",
@@ -34,13 +35,16 @@ HANDLER_MODULES = ("app.handlers.admin", "app.handlers.billing",
 
 
 async def secrets_watchdog() -> None:
-    """Warn (log + Telegram) when secrets sit inside a committed config.env."""
-    report = secrets_guard.log_report()
-    if report.get("secrets"):
-        try:
+    """Warn (log + Telegram) when secrets sit inside a committed config.env.
+
+    Purely informative — it can never take the bot or the website down.
+    """
+    try:
+        report = secrets_guard.log_report()
+        if report.get("secrets"):
             await secrets_guard.notify_admins_once_per_day()
-        except Exception as exc:
-            log.debug("secrets notice failed: %s", exc)
+    except Exception as exc:
+        log.debug("secrets watchdog skipped: %s", exc)
 
 
 async def bot_worker() -> None:
