@@ -171,6 +171,10 @@ REGISTRY: list[Group] = [
             _s("BROADCAST_DEFAULT_BUTTONS", "ব্রডকাস্টের ডিফল্ট বাটন", "broadcast",
                kind="long", placeholder="📢 জয়েন | https://t.me/mychannel",
                hint="প্রতি লাইনে একটা: লেবেল | লিংক  ·  একই লাইনে && দিলে পাশাপাশি"),
+            _s("FLOW_TIMEOUT_SECONDS", "প্রশ্ন কত সেকেন্ড পর্যন্ত সক্রিয় থাকবে", "content",
+               kind="int", default=600,
+               hint="এই সময়ের মধ্যে উত্তর না দিলে বট প্রশ্নটা বাতিল করে দেয় "
+                    "(আগে পুরোনো প্রশ্ন দিনের পর দিন সক্রিয় থাকত — টেক্সট বারবার সেভ হচ্ছিল)"),
             _s("OWNER_REPORT_ENABLED", "দৈনিক রিপোর্ট (অ্যাডমিনকে DM)", "broadcast",
                kind="bool", default=True,
                hint="প্রতিদিন ইউজার/ডেলিভারি/গেট/আয়/ক্যাশের হিসাব সরাসরি মেসেজে"),

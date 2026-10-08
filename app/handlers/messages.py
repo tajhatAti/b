@@ -11,7 +11,9 @@ from telethon import events
 from telethon.tl.custom import Button
 
 from app import config as cfg, keyboards, runtime, texts
-from app.handlers.state import ask, batch_mode, ctx as flow_ctx_state, flow as remember_flow, link_gen, peek, take
+from app.handlers import state as flow_state
+from app.handlers.state import (ask, batch_mode, ctx as flow_ctx_state,
+                               flow as remember_flow, link_gen, peek, take)
 from app.logger import log
 from app.runtime import bot, spawn
 from app import i18n
@@ -56,6 +58,30 @@ async def catch_jit_forward(event) -> None:
     if future is not None and not future.done():
         runtime.recent_jit_ids.append(event.message.id)
         future.set_result(event.message)
+
+
+async def ask_again(event, action: str, message: str, **ctx) -> None:
+    """Re-arm a question after a wrong answer — but only a couple of times.
+
+    The owner's complaint “যেকোনো টেক্সট দিলে ওটা বারে বারে সেভ হইতেছে” came from a
+    question that stayed armed forever: every random message became the answer and
+    overwrote the value. Now a flow gives up after a few tries and says so.
+    """
+    admin_id = event.sender_id
+    tries = flow_state.bump_tries(admin_id, action)
+    if tries >= flow_state.MAX_TRIES:
+        flow_state.clear(admin_id)
+        await event.respond(
+            "⚠️ <b>বারবার ভুল হচ্ছে — কাজটি বাতিল করলাম।</b>\n\n"
+            "কিছুই সেভ হয়নি। আবার শুরু করতে প্যানেলের বাটনে চাপ দিন।",
+            buttons=flow_state.cancel_buttons())
+        return
+    ask(admin_id, action, **ctx)          # a fresh question resets the counter…
+    flow_state.wrong_answers[(admin_id, action)] = tries   # …so put the count back
+    left = flow_state.tries_left(admin_id, action)
+    await event.respond(f"{message}\n\n<i>আর {left} বার চেষ্টা করা যাবে · "
+                        f"বাতিল করতে নিচের বাটনে চাপ দিন</i>",
+                        buttons=flow_state.cancel_buttons())
 
 
 # --------------------------------------------------------------- media upload
@@ -282,6 +308,13 @@ async def search_input(event) -> None:
 @bot.on(events.NewMessage(func=lambda e: e.is_private and not e.out))
 async def pending_input(event) -> None:
     admin_id = event.sender_id
+    if flow_state.drop_if_stale(admin_id):
+        # Nothing was saved — say so, otherwise it looks like the bot ate the text.
+        await event.respond(
+            "⌛️ <b>আগের প্রশ্নটির সময় শেষ হয়ে গেছে</b> — তাই আপনার লেখাটি "
+            "কোথাও সেভ হয়নি।\n\nআবার শুরু করতে প্যানেলের বাটনে চাপ দিন।",
+            buttons=flow_state.cancel_buttons())
+        return
     pending = peek(admin_id)
     if pending is None:
         return
@@ -314,8 +347,7 @@ async def pending_input(event) -> None:
     if action == "create_store":
         name = text[:60]
         if not name:
-            ask(admin_id, action, **ctx)
-            await answer("⚠️ Please send a real name.")
+            await ask_again(event, action, "⚠️ Please send a real name.", **ctx)
             return
         store = db.create_store(admin_id, name)
         db.set_active_store(admin_id, store["id"])
@@ -417,9 +449,8 @@ async def pending_input(event) -> None:
         else:
             cleaned = forcejoin_service.normalize(raw)
             if not cleaned:
-                ask(admin_id, action, **ctx)
-                await answer("⚠️ চ্যানেল চেনা গেল না — <code>@name</code>, "
-                             "<code>https://t.me/+ইনভাইট</code> বা <code>-100…</code> দিন।")
+                await ask_again(event, action, "⚠️ চ্যানেল চেনা গেল না — <code>@name</code>, "
+                             "<code>https://t.me/+ইনভাইট</code> বা <code>-100…</code> দিন।", **ctx)
                 return
             db.set_store_forcejoin(store_id, cleaned)
             forcejoin_service.clear_cache()
@@ -441,10 +472,9 @@ async def pending_input(event) -> None:
         limit = safe_int(total_part, -1)
         per_user = safe_int(per_user_part, 0) if per_user_part else 0
         if limit < 0 or per_user < 0:
-            ask(admin_id, action, **ctx)
-            await answer("⚠️ শুধু সংখ্যা লিখুন — যেমন <code>100</code> "
+            await ask_again(event, action, "⚠️ শুধু সংখ্যা লিখুন — যেমন <code>100</code> "
                          "(মোট ১০০ বার) বা <code>100/1</code> "
-                         "(মোট ১০০, একজন সর্বোচ্চ ১ বার) — <code>0</code> = আনলিমিটেড।")
+                         "(মোট ১০০, একজন সর্বোচ্চ ১ বার) — <code>0</code> = আনলিমিটেড।", **ctx)
             return
         file_row = db.file(file_id)
         if file_row is None:
@@ -477,8 +507,7 @@ async def pending_input(event) -> None:
             await answer("⚠️ No targets left — start the broadcast again.")
             return
         if not (event.raw_text or "").strip():
-            ask(admin_id, action, **ctx)
-            await answer("⚠️ Broadcast message cannot be empty — send it as text.")
+            await ask_again(event, action, "⚠️ Broadcast message cannot be empty — send it as text.", **ctx)
             return
         status = await event.respond(f"📢 Broadcasting to <b>{len(targets)}</b> user(s)…")
         spawn(run_broadcast(admin_id, targets, event.raw_text, status))
@@ -503,9 +532,8 @@ async def pending_input(event) -> None:
                     pass
         if not target:
             # Also try to parse from reply or mention?
-            ask(admin_id, action, **ctx)
-            await answer("⚠️ Please send a numeric Telegram user ID (or forward a message from them).\n"
-                         "উদাহরণ: <code>123456789</code> — ইউজারের প্রোফাইল থেকে ID নিন, অথবা তার মেসেজ ফরওয়ার্ড করুন।")
+            await ask_again(event, action, "⚠️ Please send a numeric Telegram user ID (or forward a message from them).\n"
+                         "উদাহরণ: <code>123456789</code> — ইউজারের প্রোফাইল থেকে ID নিন, অথবা তার মেসেজ ফরওয়ার্ড করুন।", **ctx)
             return
         stores = db.stores_admin(admin_id)
         if not stores:
@@ -532,8 +560,7 @@ async def pending_input(event) -> None:
         store_id = ctx.get("store_id") or flow_ctx.get("store_id")
         target = ctx.get("target") or flow_ctx.get("target")
         if days <= 0 or not store_id or not target:
-            ask(admin_id, action, **ctx, store_id=store_id, target=target)
-            await answer("⚠️ Please send a positive number of days.")
+            await ask_again(event, action, "⚠️ Please send a positive number of days.", **ctx, store_id=store_id, target=target)
             return
         store = db.store(store_id)
         if store is None:
@@ -558,8 +585,7 @@ async def pending_input(event) -> None:
         days = safe_int(text)
         store_id = ctx.get("store_id")
         if days <= 0 or not store_id:
-            ask(admin_id, action, **ctx)
-            await answer("⚠️ Please send a positive number of days.")
+            await ask_again(event, action, "⚠️ Please send a positive number of days.", **ctx)
             return
         db.set_referral_cfg(admin_id, store_id, days)
         await answer(f"✅ Referral reward set: <b>{days} days</b> per successful invite.")
@@ -569,18 +595,15 @@ async def pending_input(event) -> None:
     if action == "drip_count":
         count = safe_int(text)
         if count <= 0:
-            ask(admin_id, action, **ctx)
-            await answer("⚠️ Please send a positive number.")
+            await ask_again(event, action, "⚠️ Please send a positive number.", **ctx)
             return
-        ask(admin_id, "drip_time", store_id=ctx.get("store_id"), count=count)
-        await answer("💬 Now send the daily send time as <code>HH:MM</code> (24h).")
+        await ask_again(event, "drip_time", "💬 Now send the daily send time as <code>HH:MM</code> (24h).", store_id=ctx.get("store_id"), count=count)
         return
 
     if action == "drip_time":
         match = TIME_RE.match(text)
         if not match:
-            ask(admin_id, action, **ctx)
-            await answer("⚠️ Send the time as <code>HH:MM</code>, e.g. <code>19:30</code>.")
+            await ask_again(event, action, "⚠️ Send the time as <code>HH:MM</code>, e.g. <code>19:30</code>.", **ctx)
             return
         store_id = ctx.get("store_id")
         store = db.store(store_id) if store_id else None
@@ -724,8 +747,7 @@ async def pending_input(event) -> None:
 
         ok, result = billing.apply_coupon(code, admin_id, store, plan=plan)
         if not ok:
-            ask(admin_id, action, **ctx, store_id=store["id"])
-            await answer(f"❌ {esc(result)}\nআবার চেষ্টা করুন বা /cancel লিখুন।")
+            await ask_again(event, action, f"❌ {esc(result)}\nআবার চেষ্টা করুন বা /cancel লিখুন।", **ctx, store_id=store["id"])
             return
         if result.startswith("days:"):
             days = result.split(":", 1)[1]
@@ -764,8 +786,7 @@ async def pending_input(event) -> None:
         minutes = safe_int(text)
         state = link_gen.get(admin_id)
         if minutes <= 0:
-            ask(admin_id, action, **ctx)
-            await answer("⚠️ Please send a positive number of minutes.")
+            await ask_again(event, action, "⚠️ Please send a positive number of minutes.", **ctx)
             return
         if not state or len(state["selected"]) < 2:
             await answer("⚠️ Selection expired — pick the files again.")
@@ -785,8 +806,7 @@ async def pending_input(event) -> None:
             return
         new_name = event.raw_text.strip()[:60]
         if not new_name:
-            ask(admin_id, action, **ctx, store_id=sid)
-            await answer("⚠️ Please send a name.")
+            await ask_again(event, action, "⚠️ Please send a name.", **ctx, store_id=sid)
             return
         db.update_store(store["id"], name=new_name)
         await answer(f"✅ Store renamed to <b>{esc(new_name)}</b>.")
@@ -819,8 +839,7 @@ async def pending_input(event) -> None:
         from app.handlers.extras import global_results_buttons
         keyword = event.raw_text.strip()
         if len(keyword) < 2:
-            ask(admin_id, action)
-            await answer("⚠️ লিখুন অন্তত ২ অক্ষর।")
+            await ask_again(event, action, "⚠️ লিখুন অন্তত ২ অক্ষর।")
             return
         matches = db.search_all_stores(keyword, cfg.SEARCH_RESULT_LIMIT)
         rows = global_results_buttons(admin_id, matches)
@@ -841,8 +860,7 @@ async def pending_input(event) -> None:
             return
         new_name = event.raw_text.strip()[:80]
         if not new_name:
-            ask(admin_id, action, **ctx)
-            await answer("⚠️ Please send a name.")
+            await ask_again(event, action, "⚠️ Please send a name.", **ctx)
             return
         db.rename_file(file_row["id"], new_name)
         await answer(f"✅ Renamed to <b>{esc(new_name)}</b>.")
@@ -858,8 +876,7 @@ async def pending_input(event) -> None:
     if action == "user_search":
         query = event.raw_text.strip()
         if not query:
-            ask(admin_id, action, **ctx)
-            await answer("⚠️ লিখুন কিছু — ID, নাম বা username।")
+            await ask_again(event, action, "⚠️ লিখুন কিছু — ID, নাম বা username।", **ctx)
             return
         try:
             from app.handlers.manage import show_user_search_results
@@ -882,18 +899,16 @@ async def pending_input(event) -> None:
         ids = [safe_int(x) for x in re.split(r"[\s,]+", raw) if safe_int(x)]
         ids = list(dict.fromkeys(ids))  # unique preserve order
         if not ids:
-            ask(admin_id, action, **ctx, store_id=store_id)
-            await answer("⚠️ কোনো valid user ID পাওয়া যায়নি। আবার পাঠান।")
+            await ask_again(event, action, "⚠️ কোনো valid user ID পাওয়া যায়নি। আবার পাঠান।", **ctx, store_id=store_id)
             return
         if len(ids) > 100:
             await answer(f"⚠️ একসাথে সর্বোচ্চ ১০০ জন — আপনি পাঠিয়েছেন {len(ids)} জন। প্রথম ১০০ জন নেওয়া হলো।")
             ids = ids[:100]
         remember_flow(admin_id, bulk_ids=ids, store_id=store_id)
-        ask(admin_id, "bulk_grant_days", store_id=store_id)
-        await answer(
+        await ask_again(event, "bulk_grant_days", 
             f"👥 {len(ids)} জন ইউজার পাওয়া গেছে — এবার কতদিনের অ্যাক্সেস দেবেন?\n"
             "দিনের সংখ্যা লিখে পাঠান (যেমন <code>30</code>), অথবা <code>0</code> লিখলে লাইফটাইম।"
-        )
+        , store_id=store_id)
         return
 
     if action == "bulk_grant_days":
@@ -906,8 +921,7 @@ async def pending_input(event) -> None:
             return
         days = safe_int(text)
         if days < 0:
-            ask(admin_id, action, **ctx, store_id=store_id)
-            await answer("⚠️ দিনের সংখ্যা ০ বা তার বেশি হতে হবে (০ = লাইফটাইম)।")
+            await ask_again(event, action, "⚠️ দিনের সংখ্যা ০ বা তার বেশি হতে হবে (০ = লাইফটাইম)।", **ctx, store_id=store_id)
             return
         expires_at = None if days == 0 else time.time() + days * 86400
         granted = 0
@@ -928,8 +942,7 @@ async def pending_input(event) -> None:
     if action == "admin_file_search":
         keyword = event.raw_text.strip()
         if len(keyword) < 2:
-            ask(admin_id, action)
-            await answer("⚠️ অন্তত ২ অক্ষর লিখুন।")
+            await ask_again(event, action, "⚠️ অন্তত ২ অক্ষর লিখুন।")
             return
         matches = db.search_all_stores(keyword, 20)
         if not matches:
@@ -949,8 +962,7 @@ async def pending_input(event) -> None:
     if action == "ban_user":
         uid = safe_int(text)
         if not uid:
-            ask(admin_id, action, **ctx)
-            await answer("⚠️ Valid user ID দিন।")
+            await ask_again(event, action, "⚠️ Valid user ID দিন।", **ctx)
             return
         if access.is_admin(uid):
             await answer("⚠️ অ্যাডমিনকে ব্যান করা যায় না।")
@@ -966,8 +978,7 @@ async def pending_input(event) -> None:
     if action == "unban_user":
         uid = safe_int(text)
         if not uid:
-            ask(admin_id, action, **ctx)
-            await answer("⚠️ Valid user ID দিন।")
+            await ask_again(event, action, "⚠️ Valid user ID দিন।", **ctx)
             return
         db.unban_user(uid)
         try:
@@ -1005,8 +1016,7 @@ async def pending_input(event) -> None:
             value = ""
         ok, error = settings_service.set(key, value)
         if not ok:
-            ask(admin_id, "setting_edit", **ctx)
-            await answer(f"⚠️ {esc(error)}")
+            await ask_again(event, "setting_edit", f"⚠️ {esc(error)}", **ctx)
             return
         if key == "FORCE_CHANNEL":
             from app.services import forcejoin
@@ -1029,8 +1039,7 @@ async def pending_input(event) -> None:
         file_id = ctx.get("file_id") or 0
         body = (event.raw_text or "").strip()
         if not body and not file_id:
-            ask(admin_id, "studio_text", **ctx)
-            await answer("⚠️ খালি মেসেজ পাঠানো যাবে না — টেক্সট লিখুন বা 🎬 ফাইল বেছে নিন।")
+            await ask_again(event, "studio_text", "⚠️ খালি মেসেজ পাঠানো যাবে না — টেক্সট লিখুন বা 🎬 ফাইল বেছে নিন।", **ctx)
             return
         body = _safe_html(body)
         campaign = broadcast.create_campaign(
@@ -1050,8 +1059,7 @@ async def pending_input(event) -> None:
             return
         match = TIME_RE.match(text)
         if not match:
-            ask(admin_id, "studio_time", **ctx)
-            await answer("⚠️ সময় <b>HH:MM</b> ফরম্যাটে লিখুন (যেমন 21:30)।")
+            await ask_again(event, "studio_time", "⚠️ সময় <b>HH:MM</b> ফরম্যাটে লিখুন (যেমন 21:30)।", **ctx)
             return
         hour, minute = int(match.group(1)), int(match.group(2))
         from datetime import timedelta

@@ -465,7 +465,7 @@ async def test_search_flow_finds_files():
     from app.handlers.messages import search_input
     store, _ = _store_with_files(premium=False)
     db.add_file(store["id"], "Interstellar 2014", "Video", -100, 999)
-    state.search_pending[USER_ID] = store["id"]
+    state.start_search(USER_ID, store["id"])
 
     event = FakeEvent(USER_ID, text="interstellar")
     await search_input(event)

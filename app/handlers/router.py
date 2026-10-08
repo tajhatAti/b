@@ -59,6 +59,15 @@ async def dispatch(event: events.CallbackQuery.Event) -> None:
     if data == "noop":
         await event.answer()          # stops the endless loading spinner
         return
+    if not data.startswith("cd:"):
+        # Tapping a button means “I moved on”: drop any *question* that was still
+        # armed, so a later text can never be mistaken for its answer. The button
+        # flow context (flow_ctx) stays — many flows continue through buttons.
+        try:
+            from app.handlers.state import take as _take_question
+            _take_question(event.sender_id)
+        except Exception:
+            pass
 
     match = resolve(data)
     if match is None:

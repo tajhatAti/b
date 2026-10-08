@@ -1018,7 +1018,7 @@ async def test_bot_link_flow_accepts_total_slash_per_user(clean, monkeypatch):
     from app.handlers import messages as messages_module
     from tests.test_flows import FakeEvent
     store, file_id = _store_with_video()
-    state.pending_input[ADMIN_ID] = {"action": "link_limit", "ctx": {"file_id": file_id}}
+    state.ask(ADMIN_ID, "link_limit", file_id=file_id)
     event = FakeEvent(ADMIN_ID, text="100/1")
     await messages_module.pending_input(event)
     link = db.links(limit=1)[0]

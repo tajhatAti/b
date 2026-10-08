@@ -9,7 +9,7 @@ from telethon.tl.custom import Button
 
 from app import config as cfg, i18n, keyboards, runtime, texts, ui
 from app.handlers.router import route
-from app.handlers.state import search_pending
+from app.handlers import state
 from app.logger import log
 from app.runtime import bot
 from app.services import access, flow
@@ -215,6 +215,21 @@ async def start_handler(event: events.NewMessage.Event) -> None:
     await show_home(event, user_id)
 
 
+@route("cd:flow")
+async def cancel_flow(event, rest: str) -> None:
+    """The “✖️ বাতিল” button every question carries.
+
+    Pressing any other button already drops a pending question (see
+    `router.dispatch`), but this one is the one users actually look for.
+    """
+    state.clear(event.sender_id)
+    await event.answer("✖️ বাতিল করা হলো — কিছুই সেভ হয়নি")
+    try:
+        await event.edit("✖️ <b>বাতিল করা হলো</b> — কিছুই সেভ হয়নি।", buttons=None)
+    except Exception:
+        await event.respond("✖️ <b>বাতিল করা হলো</b> — কিছুই সেভ হয়নি।")
+
+
 @bot.on(events.NewMessage(func=lambda e: e.is_private, pattern=r"^/help"))
 async def help_handler(event: events.NewMessage.Event) -> None:
     user_id = event.sender_id
@@ -324,7 +339,7 @@ async def search_prompt(event, rest: str) -> None:
     if not access.has_access(store, event.sender_id):
         await event.answer(texts.NO_ACCESS_ALERT, alert=True)
         return
-    search_pending[event.sender_id] = store["id"]
+    state.start_search(event.sender_id, store["id"])
     await event.respond(f"🔍 Send a keyword to search inside <b>{esc(store['name'])}</b>\n"
                         f"<i>(send /cancel to stop)</i>")
     await event.answer()

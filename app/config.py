@@ -122,6 +122,10 @@ LEGACY_DB_FILE = get_str("LEGACY_DB_FILE", str(BASE_DIR / "bot_db.json"))
 BACKUP_DIR = get_str("BACKUP_DIR", str(BASE_DIR / "backups"))
 LOG_FILE = get_str("LOG_FILE", str(BASE_DIR / "logs" / "bot.log"))
 SESSION_STATE_FILE = get_str("SESSION_STATE_FILE", str(BASE_DIR / "bot_master.session"))
+
+# How long a pending question ("send me the channel link", "how many clicks?")
+# stays armed. Kept short on purpose — see app/handlers/state.py.
+FLOW_TIMEOUT_SECONDS = get_int("FLOW_TIMEOUT_SECONDS", 600)
 BACKUP_HOUR = get_int("BACKUP_HOUR", 4)           # local hour for the daily JSON export
 KEEP_BACKUPS = get_int("KEEP_BACKUPS", 7)
 
