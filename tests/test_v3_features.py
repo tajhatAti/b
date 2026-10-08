@@ -1258,3 +1258,59 @@ async def test_a_new_order_and_new_user_alert_reach_the_admin_inbox(clean, monke
     assert any("নতুন অর্ডার #5" in text for _, text in sent)
     settings_service.set("ALERT_CHANNEL", "")
     alerts._last_sent.clear()
+
+
+# ------------------------------------------- hosting panel live URL (/live/<job>)
+@pytest.fixture()
+def client_factory(tmp_path, monkeypatch):
+    """A TestClient on a throw-away database (FastAPI is optional in this file)."""
+    fastapi = pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from app import config as cfg
+
+    def make():
+        db.bind(str(tmp_path / "panel.sqlite3"))
+        monkeypatch.setattr(cfg, "WEB_USER", "admin")
+        monkeypatch.setattr(cfg, "WEB_PASS", "secret")
+        monkeypatch.setattr(cfg, "WEB_SECRET", "test-secret")
+        import web.dashboard as dashboard
+        return TestClient(dashboard.app)
+
+    return make
+
+def test_the_panel_prefix_is_normalized_safely():
+    from app.services import basepath
+
+    assert basepath.normalize("/live/u16-b-2576c1") == "/live/u16-b-2576c1"
+    assert basepath.normalize("/live/abc/") == "/live/abc"
+    assert basepath.normalize("/") == ""
+    assert basepath.normalize("live/abc") == ""          # must be root-absolute
+    assert basepath.normalize("/live/../../etc") == ""   # no escaping the prefix
+    assert basepath.normalize("/" + "x" * 400) == ""
+
+
+def test_links_stay_inside_the_panel_prefix():
+    from app.services import basepath
+
+    html = '<a href="/admin/files">f</a><form action="/admin/login"></form>'
+    basepath.set_prefix("/live/job1")
+    try:
+        out = basepath.relativize(html)
+        assert 'href="admin/files"' in out
+        assert 'action="admin/login"' in out
+        assert basepath.url("/health") == "/live/job1/health"
+    finally:
+        basepath.set_prefix("")
+
+
+def test_the_page_carries_the_prefix_as_its_base_url(client_factory):
+    """With `X-Forwarded-Prefix` the browser must stay under /live/<job>/."""
+    client = client_factory()
+    page = client.get("/help", headers={"X-Forwarded-Prefix": "/live/u16-b-2576c1"})
+    assert page.status_code == 200
+    assert '<base href="/live/u16-b-2576c1/">' in page.text
+    assert 'href="admin"' in page.text                  # relative → stays prefixed
+    assert 'href="/admin"' not in page.text             # root-absolute would escape
+    plain = client.get("/help")
+    assert '<base href="/">' in plain.text              # normal run is unchanged

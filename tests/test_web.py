@@ -556,3 +556,76 @@ def test_old_users_can_be_purged_safely(client):
     assert db.user(901) is None
     assert db.user(902) is not None
     assert db.user(ADMIN_ID) is not None               # admins are never purged
+
+
+# ---------------------------------------- hosting panel: the job must open $PORT
+def _free_port() -> int:
+    import socket
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+@pytest.mark.parametrize("entry", ["main.py", "bot.py"])
+def test_a_hosted_job_opens_its_web_port(tmp_path, entry):
+    """CodeNest/RunSpace runs an entry file and waits for it to listen on $PORT.
+
+    “The job is running, but no web listener yet” is what the panel shows when
+    nothing binds that port — so every entry point must serve the website, even
+    while the bot itself is unconfigured.
+    """
+    import os
+    import subprocess
+    import sys
+    import time
+    import urllib.request
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    port = _free_port()
+    env = dict(os.environ)
+    env.pop("BOT_ENV_FILE", None)
+    for leaked in ("API_ID", "API_HASH", "BOT_TOKEN", "STRING_SESSION"):  # from config.env
+        env.pop(leaked, None)
+    env.update({
+        "PORT": str(port),
+        "WEB_USER": "admin", "WEB_PASS": "demo", "WEB_SECRET": "demo-secret",
+        "WEB_TITLE": "Host Test", "DB_FILE": str(tmp_path / "hosted.sqlite3"),
+        "BOT_ENV_FILE": str(tmp_path / "empty.env"),        # no real credentials
+        "ADMIN_IDS": "999", "WEB_ENABLED": "false",          # a panel only sets PORT
+    })
+    (tmp_path / "empty.env").write_text("", encoding="utf-8")
+
+    proc = subprocess.Popen([sys.executable, entry], cwd=str(root), env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    try:
+        base = f"http://127.0.0.1:{port}"
+        deadline = time.time() + 60
+        last_error = ""
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                break
+            try:
+                with urllib.request.urlopen(base + "/health", timeout=2) as response:
+                    assert response.status == 200
+                    break
+            except Exception as exc:               # not listening yet
+                last_error = str(exc)
+                time.sleep(0.4)
+        else:
+            pytest.fail(f"{entry} never opened port {port} ({last_error})")
+
+        assert proc.poll() is None, f"{entry} exited instead of serving the site"
+        request = urllib.request.Request(base + "/", headers={
+            "X-Forwarded-Prefix": "/live/u16-b-2576c1"})
+        with urllib.request.urlopen(request, timeout=5) as response:
+            html = response.read().decode("utf-8", "ignore")
+        assert '<base href="/live/u16-b-2576c1/">' in html
+        assert 'href="admin"' in html                  # links stay under the prefix
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()

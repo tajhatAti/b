@@ -104,8 +104,11 @@ async def run() -> int:
     if imported:
         log.info("Imported the legacy bot_db.json: %s", imported)
 
-    tasks = [asyncio.create_task(web_worker()),
-             asyncio.create_task(secrets_watchdog())]
+    tasks = [asyncio.create_task(secrets_watchdog())]
+    if cfg.WEB_ENABLED or cfg.HOSTED:
+        tasks.insert(0, asyncio.create_task(web_worker()))
+    else:
+        log.warning("Website disabled (WEB_ENABLED=false) — only the bot runs.")
     problems = cfg.validate()
     if problems:
         log.error("Bot not started — configuration problem(s): %s", "; ".join(problems))

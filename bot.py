@@ -6,6 +6,7 @@ Configuration lives in `config.env` (see config.env.example) — never in the co
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 
 from telethon import TelegramClient
@@ -74,10 +75,30 @@ async def admin_error_notifier(text: str) -> None:
 
 def main() -> int:
     setup_logging()
+
+    if cfg.HOSTED:
+        # A hosting panel (CodeNest/RunSpace, Render, Railway…) sets $PORT and
+        # waits for us to listen on it. `run.py` is exactly that product — the
+        # website plus a bot that reconnects instead of dying — so reuse it
+        # rather than keeping two entry points that drift apart.
+        from run import main as run_main
+        log.info("$PORT detected (%s) — starting the combined website + bot runner",
+                 cfg.WEB_PORT)
+        return run_main()
+
+    # Local run: the website is optional (WEB_ENABLED), the bot is the point.
+    website = start_website() if cfg.WEB_ENABLED else None
+
     problems = cfg.validate()
     if problems:
         log.error("Configuration problem(s): %s", "; ".join(problems))
-        log.error("Copy config.env.example to config.env and fill in your values.")
+        log.error("Copy config.env.example to config.env and fill in your values "
+                  "(or set them in the hosting panel's environment variables).")
+        if website is not None and os.getenv("PORT"):
+            # Keep the process (and the port) alive so the panel's URL still works.
+            log.error("The website keeps running — open the live URL, fix the values "
+                      "in the panel, then restart the job.")
+            website.join()
         return 2
 
     db.bind(cfg.DB_FILE)
@@ -137,9 +158,18 @@ def main() -> int:
     return 0
 
 
-async def serve_website() -> None:
-    """Serve the store front + admin panel in this same process."""
+def start_website() -> "threading.Thread | None":
+    """Serve the store front + admin panel in a background thread.
+
+    Hosting panels (CodeNest/RunSpace, Render, Railway…) pick `bot.py` as the
+    entry point when a repository has one — and then expect the job to open a
+    web port. Without this, the panel shows “The job is running, but no web
+    listener yet”. A daemon thread keeps the site up no matter what the bot is
+    doing, and the port it binds is `$PORT` (that is what the panel routes to).
+    """
     try:
+        import threading
+
         import uvicorn
 
         from web.dashboard import app as web_app
@@ -147,11 +177,14 @@ async def serve_website() -> None:
         server = uvicorn.Server(uvicorn.Config(web_app, host=cfg.WEB_HOST,
                                                port=cfg.WEB_PORT, log_level="info",
                                                access_log=False))
-        log.info("Website on http://%s:%s (admin user %s)",
+        thread = threading.Thread(target=server.run, name="website", daemon=True)
+        thread.start()
+        log.info("Website on http://%s:%s (admin user %s) — panel URL: /live/<job>/",
                  cfg.WEB_HOST, cfg.WEB_PORT, cfg.WEB_USER)
-        await server.serve()
+        return thread
     except Exception as exc:
         log.error("Website could not start: %s", exc)
+        return None
 
 
 async def disconnect_all(client: TelegramClient) -> None:

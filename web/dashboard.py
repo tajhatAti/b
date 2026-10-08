@@ -48,8 +48,8 @@ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,     # n
 from app import config as cfg                                                 # noqa: E402
 from app import runtime                                                       # noqa: E402
 from app.logger import log, setup_logging                                     # noqa: E402
-from app.services import (access, billing, bot_texts, broadcast, channels,    # noqa: E402
-                          forcejoin, secrets_guard, settings)
+from app.services import (access, basepath, billing, bot_texts, broadcast,    # noqa: E402
+                          channels, forcejoin, secrets_guard, settings)
 from app.storage import db                                                    # noqa: E402
 from app.utils import esc, fmt_ts, human_size, money                          # noqa: E402
 from web import panels                                                        # noqa: E402
@@ -205,8 +205,13 @@ def layout(title: str, body: str, active: str = "", admin: bool = True) -> str:
     right = ('<a class="btn grey" href="/admin/logout">Logout</a>' if admin
              else '<a class="btn" href="/admin">Admin</a>')
     brand = html.escape(settings.get_str("WEB_TITLE", "Store") or "Store") + " · Bot"
-    return f"""<!doctype html><html lang="bn"><head><meta charset="utf-8">
+    # Behind a hosting panel the site lives under /live/<job>/ (the proxy sends
+    # X-Forwarded-Prefix). `<base href>` makes every link in the page resolve
+    # through that prefix, so the same HTML works on the panel and on the root.
+    base = basepath.current() or ""
+    page = basepath.relativize(f"""<!doctype html><html lang="bn"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<base href="__BASEPATH__/">
 <title>{html.escape(title)} · {brand}</title>
 <meta name="description" content="Telegram store — files delivered instantly by bot.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎬</text></svg>">
@@ -218,7 +223,9 @@ def layout(title: str, body: str, active: str = "", admin: bool = True) -> str:
 </header>
 <main>{body}</main>
 <footer>Powered by the Telegram store bot · <span class="muted">files are delivered by the bot itself</span></footer>
-</body></html>"""
+</body></html>""")
+    # The <base> itself must stay root-absolute — relativize() runs first.
+    return page.replace("__BASEPATH__", base)
 
 
 def card(label: str, value) -> str:
@@ -253,6 +260,24 @@ def create_app() -> FastAPI:
     app = FastAPI(title="Store Bot Web", docs_url=None, redoc_url=None)
 
     # ------------------------------------------------------------------- site
+    @app.middleware("http")
+    async def honor_proxy_prefix(request: Request, call_next):
+        """Live behind CodeNest/RunSpace: keep every link inside /live/<job>/.
+
+        The panel's gateway strips the prefix before forwarding it and tells us
+        what it was in `X-Forwarded-Prefix`. We remember it for this request (so
+        `layout()` can emit the right `<base href>`) and set Starlette's
+        `root_path`, so anything the framework generates matches as well.
+        """
+        prefix = basepath.set_prefix(request.headers.get("x-forwarded-prefix")
+                                     or request.headers.get("x-script-name"))
+        if prefix:
+            request.scope["root_path"] = prefix
+        try:
+            return await call_next(request)
+        finally:
+            basepath.set_prefix("")
+
     @app.get("/", response_class=HTMLResponse)
     async def home(request: Request) -> str:
         stores = db.all_stores()
@@ -1732,7 +1757,13 @@ def create_app() -> FastAPI:
                                 status_code=303)
 
     @app.get("/health")
-    async def health() -> JSONResponse:
+    async def health(request: Request) -> JSONResponse:
+        """Who am I, where am I listening, and is the bot online?
+
+        Hosting panels and the live-URL gateway poll this, so it also reports the
+        port we bound and the prefix we are served under (`/live/<job>`), which is
+        exactly what to check when a panel says “no web listener yet”.
+        """
         stats = db.stats()
         return JSONResponse({
             "ok": True,
@@ -1744,6 +1775,12 @@ def create_app() -> FastAPI:
             "stores": stats["stores"],
             "pending_orders": stats["orders_pending"],
             "time": int(time.time()),
+            "host": cfg.WEB_HOST,
+            "port": cfg.WEB_PORT,
+            "from_port_env": cfg.HOSTED,
+            "url_prefix": basepath.current() or basepath.normalize(
+                request.headers.get("x-forwarded-prefix") or ""),
+            "web_enabled": cfg.WEB_ENABLED,
         })
 
     return app

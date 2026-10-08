@@ -151,7 +151,10 @@ INLINE_ENABLED = get_bool("INLINE_ENABLED", True)
 INLINE_RESULTS = get_int("INLINE_RESULTS", 20)
 
 # --------------------------------------------------------------- web dashboard
-WEB_ENABLED = get_bool("WEB_ENABLED", False)
+# The product is website *and* bot: the site is on unless the owner switches it
+# off, and any hosted run (a panel always injects $PORT) is always on — that is
+# what makes the live URL appear.
+WEB_ENABLED = get_bool("WEB_ENABLED", True)
 WEB_HOST = get_str("WEB_HOST", "0.0.0.0")
 # Hosting panels (CodeNest, Render, Railway, …) inject $PORT and route to it.
 WEB_PORT = get_int("PORT", get_int("WEB_PORT", 8080))
@@ -160,6 +163,10 @@ WEB_PASS = get_str("WEB_PASS")
 WEB_SECRET = get_str("WEB_SECRET", "")
 WEB_SESSION_HOURS = get_int("WEB_SESSION_HOURS", 72)
 WEB_TITLE = get_str("WEB_TITLE", "Store")
+#: True when a hosting panel gave us a port to listen on (CodeNest/RunSpace,
+#: Render, Railway…). The website must then start even if WEB_ENABLED was
+#: switched off, otherwise the panel shows “no web listener”.
+HOSTED = bool(get_str("PORT"))
 # Public site settings
 SITE_ENABLED = get_bool("SITE_ENABLED", True)
 SITE_TAGLINE = get_str("SITE_TAGLINE", "")
