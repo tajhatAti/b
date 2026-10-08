@@ -629,3 +629,30 @@ def test_a_hosted_job_opens_its_web_port(tmp_path, entry):
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             proc.kill()
+
+
+def test_the_panel_host_variable_is_followed(tmp_path):
+    """RunSpace sets HOST=0.0.0.0 for web jobs — we must not ignore it."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    env = dict(os.environ)
+    env.pop("BOT_ENV_FILE", None)
+    env.pop("WEB_HOST", None)                     # the panel only gives HOST+PORT
+    env.update({"HOST": "0.0.0.0", "PORT": "11000"})
+    out = subprocess.run([sys.executable, "-c",
+                          "from app import config as c; print(c.WEB_HOST, c.WEB_PORT)"],
+                         cwd=str(root), env=env, capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.split() == ["0.0.0.0", "11000"]
+
+    env.pop("HOST")
+    env["WEB_HOST"] = "127.0.0.1"
+    out = subprocess.run([sys.executable, "-c",
+                          "from app import config as c; print(c.WEB_HOST)"],
+                         cwd=str(root), env=env, capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "127.0.0.1"        # an explicit value still wins

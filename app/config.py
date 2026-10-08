@@ -155,7 +155,9 @@ INLINE_RESULTS = get_int("INLINE_RESULTS", 20)
 # off, and any hosted run (a panel always injects $PORT) is always on — that is
 # what makes the live URL appear.
 WEB_ENABLED = get_bool("WEB_ENABLED", True)
-WEB_HOST = get_str("WEB_HOST", "0.0.0.0")
+# Hosting panels inject HOST=0.0.0.0 for web-capable jobs (the runner does it),
+# so follow that when the owner did not set WEB_HOST explicitly.
+WEB_HOST = get_str("WEB_HOST", get_str("HOST", "0.0.0.0"))
 # Hosting panels (CodeNest, Render, Railway, …) inject $PORT and route to it.
 WEB_PORT = get_int("PORT", get_int("WEB_PORT", 8080))
 WEB_USER = get_str("WEB_USER", "admin")
