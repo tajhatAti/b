@@ -837,9 +837,15 @@ def create_app() -> FastAPI:
             <label>Audience</label><select name=audience>{_audience_options()}</select>
             <label>Caption (optional, <code>{{name}}</code> সমর্থিত)</label>
             <textarea name=text rows=4 placeholder="এই ভিডিওটি আপনার জন্য 🎬"></textarea>
+            <label>ইনলাইন বাটন — প্রতি লাইনে একটা: <code>লেবেল | https://লিংক</code>
+                   (একই লাইনে <code>&amp;&amp;</code> দিলে পাশাপাশি)</label>
+            <textarea name=buttons rows=2 placeholder="🟢 স্টোর খুলুন | https://t.me/your_bot"></textarea>
+            <label class="chk"><input type=checkbox name=online value=1 checked>
+                   🟢 “অনলাইন — স্টোর খুলুন” বাটন যোগ করুন</label>
             <div class="row">
               <button class="ok" name=action value=start>🚀 শুরু করুন</button>
               <button class="warn" name=action value=test>🧪 আমাকে টেস্ট পাঠান</button>
+              <a class="btn grey" href="/admin/broadcast">📢 পুরো স্টুডিও</a>
             </div>
           </form>
         </div>"""
@@ -847,7 +853,8 @@ def create_app() -> FastAPI:
 
     @app.post("/admin/files/broadcast/{file_id}")
     async def file_broadcast_post(request: Request, file_id: int, audience: str = Form("all"),
-                                  text: str = Form(""), action: str = Form("start")):
+                                  text: str = Form(""), action: str = Form("start"),
+                                  buttons: str = Form(""), online: str = Form("")):
         blocked = _guard(request)
         if blocked:
             return blocked
@@ -857,9 +864,10 @@ def create_app() -> FastAPI:
         if not broadcast.resolve_audience(0, audience):
             return RedirectResponse("/admin/files?flash=এই+অডিয়েন্সে+কেউ+নেই", status_code=303)
         owner = cfg.ADMIN_IDS[0] if cfg.ADMIN_IDS else 0
-        campaign = broadcast.create_campaign(owner, text=(text or "").strip(),
-                                            title=file_row["name"][:40],
-                                            audience=audience, files=[file_id], start=True)
+        campaign = broadcast.create_campaign(
+            owner, text=(text or "").strip(), title=file_row["name"][:40],
+            audience=audience, files=[file_id], start=True,
+            buttons=buttons.strip(), online_button=1 if online else 0)
         if action == "test":
             if cfg.ADMIN_IDS:
                 await broadcast.test_send(campaign["id"], [cfg.ADMIN_IDS[0]])

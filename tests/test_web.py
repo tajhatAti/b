@@ -443,3 +443,40 @@ def test_home_teaches_the_three_steps(client):
     page = client.get("/")
     assert "কীভাবে ফাইল পাবেন" in page.text
     assert "সোজা ভিডিও" in page.text
+
+
+# ------------------------------------------- per-video broadcast from the panel
+def test_per_video_broadcast_from_the_website(client):
+    store = _store("Free Movies")
+    file_id = db.files_of(store["id"])[0]["id"]
+    db.touch_user(USER_ID, "Rahim", "rahim")
+    resp = client.post(
+        f"/admin/files/broadcast/{file_id}",
+        data={"audience": "all", "text": "এই ভিডিওটি আপনার জন্য 🎬", "action": "start",
+              "online": "1", "buttons": "🔗 সাইট | https://example.com"},
+        headers=_auth(), follow_redirects=False)
+    assert resp.status_code == 303
+    campaign_id = int(str(resp.headers["location"]).split("?")[0].rsplit("/", 1)[-1])
+    campaign = db.campaign(campaign_id)
+    assert campaign is not None
+    assert campaign["file_ids"] == [file_id]
+    assert "ভিডিও" in (campaign["text"] or "")
+    assert campaign["buttons"] == "🔗 সাইট | https://example.com"
+    assert campaign["online_button"] == 1
+    assert USER_ID in db.campaign_user_ids(campaign_id)
+
+
+def test_campaign_buttons_can_be_turned_off_per_campaign(client):
+    """The “online” switch is per campaign, so one broadcast can skip it."""
+    store = _store("Free Movies")
+    file_id = db.files_of(store["id"])[0]["id"]
+    db.touch_user(USER_ID, "Rahim", "rahim")
+    resp = client.post(f"/admin/files/broadcast/{file_id}",
+                       data={"audience": "all", "text": "x", "action": "start"},
+                       headers=_auth(), follow_redirects=False)
+    campaign_id = int(str(resp.headers["location"]).split("?")[0].rsplit("/", 1)[-1])
+    campaign = db.campaign(campaign_id)
+    assert campaign["online_button"] == 0
+    from app.services import broadcast as broadcast_service
+    labels = [label for row in broadcast_service.campaign_buttons(campaign) for label, _ in row]
+    assert not any("অনলাইন" in label for label in labels)

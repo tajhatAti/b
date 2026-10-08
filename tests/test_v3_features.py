@@ -1079,3 +1079,78 @@ async def test_renewal_notice_is_bengali_by_default(clean, monkeypatch):
             i18n.t(grant["user_id"], "renewal_notice", store=_esc(grant["store_name"]),
                    date=_fmt(grant["expires_at"])))
     assert sent and "অ্যাক্সেস" in sent[0][1]
+
+
+# ---------------------------------------------------- channel composer (posts)
+@pytest.mark.asyncio
+async def test_channel_post_carries_inline_buttons_and_footer(clean, monkeypatch):
+    from app.services import channels as channels_service, settings
+    store, file_id = _store_with_video()
+    settings.set("CHANNEL_POST_FOOTER", "📢 আমাদের চ্যানেল")
+    captured = []
+
+    async def fake_send_text(peer, body, buttons=None, link_preview=False):
+        captured.append((peer, body, buttons))
+        return SimpleNamespace(id=77)
+
+    monkeypatch.setattr(channels_service, "send_text", fake_send_text)
+    result = await channels_service.publish(
+        "@my_channel", text="নতুন ভিডিও এসেছে 🎬",
+        buttons="🔗 সাইট | https://example.com && 📢 চ্যানেল | https://t.me/my_channel")
+    assert result["ok"] and result["message_id"] == 77
+    peer, body, buttons = captured[0]
+    assert peer == "@my_channel" and "📢 আমাদের চ্যানেল" in body
+    assert len(buttons) == 1 and len(buttons[0]) == 2           # && = same row
+    assert buttons[0][0][0] == "🔗 সাইট" and buttons[0][1][1] == "https://t.me/my_channel"
+    settings.reset("CHANNEL_POST_FOOTER")
+
+
+@pytest.mark.asyncio
+async def test_channel_post_in_link_mode_hides_the_media(clean, monkeypatch):
+    """“ভিডিও না দিয়ে লিংক দিন (১০০ বার)” — the channel gets the button only."""
+    from app.services import channels as channels_service
+    store, file_id = _store_with_video()
+    delivered = []
+
+    async def fake_deliver(*_args, **_kwargs):
+        delivered.append(_args)
+        from app.services.sender import Delivery
+        return Delivery(True)
+
+    async def fake_send_text(peer, body, buttons=None, link_preview=False):
+        return SimpleNamespace(id=88)
+
+    monkeypatch.setattr(channels_service, "deliver", fake_deliver)
+    monkeypatch.setattr(channels_service, "send_text", fake_send_text)
+    monkeypatch.setattr(runtime, "bot_username", "test_bot")
+    result = await channels_service.publish("@c", text="নতুন", file_ids=[file_id],
+                                            link_limit=100)
+    assert result["ok"] and delivered == []                    # no media in the channel
+    link = db.links(limit=1)[0]
+    assert link["max_clicks"] == 100
+    assert link_file_ids_link(link["token"]) == [file_id]
+
+
+def link_file_ids_link(token: str) -> list[int]:
+    """The link points at the same file the channel post was about."""
+    return db.link_file_ids(token)
+
+
+@pytest.mark.asyncio
+async def test_channel_post_with_file_delivers_it_with_buttons(clean, monkeypatch):
+    from app.services import channels as channels_service
+    from app.services.sender import Delivery
+    store, file_id = _store_with_video()
+    calls = []
+
+    async def fake_deliver(peer, row, caption, buttons=None):
+        calls.append((peer, row["id"], caption, buttons))
+        return Delivery(True)
+
+    monkeypatch.setattr(channels_service, "deliver", fake_deliver)
+    result = await channels_service.publish("@c", text="একদম নতুন", file_ids=[file_id],
+                                            buttons="🔗 দেখুন | https://example.com")
+    assert result["ok"] and result["sent"] == 1
+    peer, sent_file, caption, buttons = calls[0]
+    assert sent_file == file_id and "একদম নতুন" in caption
+    assert buttons and buttons[0][0][1] == "https://example.com"
