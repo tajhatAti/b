@@ -1,0 +1,706 @@
+"""v3 features: media filter, limited links, force-join gate, analytics, channels.
+
+These are the behaviours the owner asked for by name:
+
+* “যেকোনো টেক্সট দিলে বারে বারে সেভ হইতেছে” → only video/photo may be stored.
+* “লিংকে ক্লিক করলে সোজা ভিডিও আসবে” → one tap, gate first.
+* “১০০ বার খোলা যাবে, ১০১তম বারে লিমিট শেষ” → link click limit.
+* “অ্যাডমিন প্যানেলে কে কী দেখল / কতজন কনভার্ট হল” → `events` analytics.
+* “চ্যানেলে ইনলাইন বাটন দিয়ে মেসেজ পাঠানো” → channel composer.
+"""
+from __future__ import annotations
+
+import time
+from types import SimpleNamespace
+
+import pytest
+
+from app import config as cfg, runtime
+from app.handlers import state
+from app.services import broadcast, channels, flow, forcejoin, media_guard
+from app.storage import db
+
+ADMIN_ID = 999
+USER_ID = 555
+
+
+# --------------------------------------------------------------------- fixtures
+class FakeMessage:
+    """A Telegram message good enough for the media guard."""
+
+    def __init__(self, *, video=False, photo=False, audio=False, document=False,
+                 sticker=False, media=True, text="", caption="", media_class="MessageMediaDocument"):
+        self.video = SimpleNamespace(duration=42) if video else None
+        self.photo = SimpleNamespace(id=1) if photo else None
+        self.audio = object() if audio else None
+        self.document = object() if document else None
+        self.sticker = object() if sticker else None
+        self.gif = None
+        self.poll = None
+        self.geo = None
+        self.contact = None
+        self.file = SimpleNamespace(size=1024) if (video or photo or audio or document) else None
+        self.media = _media_object(media_class) if media else None
+        self.message = caption
+        self.raw_text = text
+        self.id = 42
+
+    class _Media:
+        pass
+
+
+class _WebPage:
+    """Mimics tl.MessageMediaWebPage (has .webpage)."""
+
+    def __init__(self):
+        self.webpage = object()
+
+
+def _media_object(media_class: str):
+    if media_class == "MessageMediaWebPage":
+        cls = type("MessageMediaWebPage", (), {})
+        obj = cls()
+        obj.webpage = object()
+        return obj
+    return type(media_class, (), {"document": object()})() if media_class != "MessageMediaPhoto" \
+        else type(media_class, (), {"photo": object()})()
+
+
+def _plain_text_message(text="https://example.com/a/b"):
+    """A text message with a link preview — Telegram sets `.media` for these."""
+    return FakeMessage(media=True, text=text, media_class="MessageMediaWebPage")
+
+
+def _video_message(caption="New video"):
+    return FakeMessage(video=True, caption=caption)
+
+
+@pytest.fixture()
+def clean(tmp_path, monkeypatch):
+    db.bind(str(tmp_path / "v3.sqlite3"))
+    monkeypatch.setattr(cfg, "ADMIN_IDS", [ADMIN_ID])
+    state.pending_input.clear()
+    state.search_pending.clear()
+    state.flow_ctx.clear()
+    state.batch_mode.clear()
+    runtime.force_join_ok.clear()
+    runtime.force_join_cache.clear()
+    db.touch_user(USER_ID, "Tester", "tester")
+    db.touch_user(ADMIN_ID, "Owner", "owner")
+    return monkeypatch
+
+
+def _store_with_video(name="Movies", premium=False):
+    store = db.create_store(ADMIN_ID, name)
+    db.update_store(store["id"], is_premium=1 if premium else 0)
+    file_id = db.add_file(store["id"], "Movie 1", "Video", -100, 10)
+    db.set_mirror(file_id, ADMIN_ID, 500)
+    return db.store(store["id"]), file_id
+
+
+# --------------------------------------------------------------- media guard
+def test_plain_text_is_never_media():
+    assert media_guard.classify(_plain_text_message())[0] is None
+    assert media_guard.is_plain_text(_plain_text_message())
+
+
+def test_text_with_link_preview_is_refused_with_clear_reason():
+    kind, reason = media_guard.classify(_plain_text_message())
+    assert kind is None and reason == "text"
+    assert "সেভ হয়" in media_guard.REJECT_TEXT
+
+
+def test_video_and_photo_are_accepted():
+    assert media_guard.classify(_video_message())[0] == "Video"
+    assert media_guard.classify(FakeMessage(photo=True, media_class="MessageMediaPhoto"))[0] == "Photo"
+
+
+def test_audio_document_and_stickers_are_refused():
+    assert media_guard.classify(FakeMessage(audio=True))[0] is None
+    assert media_guard.classify(FakeMessage(document=True))[0] is None
+    assert media_guard.classify(FakeMessage(sticker=True))[0] is None
+
+
+def test_allowed_kinds_can_be_widened_from_the_panel(clean):
+    from app.services import settings
+    assert media_guard.allowed_kinds() == {"Video", "Photo"}
+    settings.set("CONTENT_MEDIA_KINDS", "video,photo,document")
+    assert "Document" in media_guard.allowed_kinds()
+    settings.reset("CONTENT_MEDIA_KINDS")
+
+
+def test_item_name_comes_from_the_caption():
+    assert media_guard.display_name(_video_message("Episode 07 HD"), "Video", 3) == "Episode 07 HD"
+    assert media_guard.display_name(_video_message(""), "Video", 3) == "Video 3"
+    assert media_guard.duration_of(_video_message()) == 42
+
+
+# --------------------------------------------------------------- limited links
+def test_limited_link_allows_n_clicks_then_refuses(clean):
+    store, file_id = _store_with_video()
+    token = db.create_link(ADMIN_ID, [file_id], None, kind="limited", max_clicks=3)
+    assert db.link_clicks(token) == 0
+    for expected in (1, 2, 3):
+        got = db.link_take(token)
+        assert got["ok"] and got["clicks"] == expected
+    blocked = db.link_take(token)
+    assert blocked["ok"] is False and blocked["reason"] == "limit"
+    assert blocked["limit"] == 3 and blocked["clicks"] == 3
+
+
+def test_unlimited_link_never_runs_out(clean):
+    store, file_id = _store_with_video()
+    token = db.create_link(ADMIN_ID, [file_id], None)
+    for _ in range(50):
+        assert db.link_take(token)["ok"] is True
+
+
+def test_link_take_reports_expired(clean):
+    store, file_id = _store_with_video()
+    token = db.create_link(ADMIN_ID, [file_id], time.time() - 10)
+    assert db.link_take(token)["reason"] == "expired"
+
+
+# ------------------------------------------------------------- force-join gate
+class GateEvent:
+    """Event that records what the flow tried to send."""
+
+    def __init__(self, user_id, chat_id=None):
+        self.sender_id = user_id
+        self.chat_id = chat_id or user_id
+        self.sent: list[tuple] = []
+        self.answers: list[tuple] = []
+
+    async def respond(self, text=None, buttons=None, **_kwargs):
+        self.sent.append((text, buttons))
+        return SimpleNamespace(id=1)
+
+    async def answer(self, text=None, alert=False):
+        self.answers.append((text, alert))
+
+    async def edit(self, text=None, buttons=None, **_kwargs):
+        return SimpleNamespace(id=1)
+
+
+@pytest.fixture()
+def collected_sends(monkeypatch):
+    sent: list[tuple] = []
+
+    async def fake_send_text(chat_id, text, buttons=None, link_preview=False):
+        sent.append((chat_id, text, buttons))
+        return SimpleNamespace(id=1, chat_id=chat_id)
+
+    monkeypatch.setattr("app.services.sender.send_text", fake_send_text)
+    return sent
+
+
+@pytest.fixture()
+def recorded_deliveries(monkeypatch):
+    calls = []
+
+    async def fake_deliver(chat_id, file_row, caption_text=None, buttons=None):
+        from app.services.sender import Delivery
+        calls.append((chat_id, file_row["id"]))
+        return Delivery(True)
+
+    monkeypatch.setattr("app.services.flow.deliver", fake_deliver)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_store_channel_gate_blocks_before_delivery(clean, monkeypatch, collected_sends,
+                                                         recorded_deliveries):
+    store, file_id = _store_with_video()
+    db.set_store_forcejoin(store["id"], "@store_only")
+    monkeypatch.setattr(runtime, "get_client", lambda: SimpleNamespace())
+
+    async def fake_check_many(user_id, store_id=None):
+        return {"ok": False, "missing": [{"id": 0, "ref": "@store_only", "title": "Store only",
+                                          "chat_id": -100123, "invite": "https://t.me/store_only"}],
+                "skipped": 0, "checked": 1}
+
+    monkeypatch.setattr(forcejoin, "check_many", fake_check_many)
+
+    event = GateEvent(USER_ID)
+    state_value = await flow.open_file(event, file_id)
+    assert state_value == flow.GATE_JOIN
+    assert recorded_deliveries == []                     # nothing sent before joining
+    assert collected_sends and "জয়েন" in collected_sends[-1][1]
+    assert db.join_prompt(USER_ID, file_id) is not None
+    assert db.events(name="join_block", user_id=USER_ID, file_id=file_id)
+
+
+@pytest.mark.asyncio
+async def test_joining_first_then_receiving_the_video(clean, monkeypatch, collected_sends,
+                                                      recorded_deliveries):
+    store, file_id = _store_with_video()
+    db.set_store_forcejoin(store["id"], "@store_only")
+
+    async def not_joined(user_id, store_id=None):
+        return {"ok": False, "skipped": 0, "checked": 1,
+                "missing": [{"id": 0, "ref": "@store_only", "title": "Store only",
+                             "chat_id": -100123, "invite": "https://t.me/store_only"}]}
+
+    monkeypatch.setattr(forcejoin, "check_many", not_joined)
+    event = GateEvent(USER_ID)
+    assert await flow.open_file(event, file_id) == flow.GATE_JOIN
+
+    async def joined(user_id, store_id=None):
+        return {"ok": True, "missing": [], "skipped": 0, "checked": 1}
+
+    monkeypatch.setattr(forcejoin, "check_many", joined)
+    state_value = await flow.confirm_join(event, USER_ID, file_id)
+    assert state_value == flow.GATE_OK
+    assert recorded_deliveries == [(USER_ID, file_id)]
+    assert db.join_prompt(USER_ID, file_id) is None
+    assert db.events(name="deliver", user_id=USER_ID, file_id=file_id)
+
+
+@pytest.mark.asyncio
+async def test_fail_open_when_membership_cannot_be_checked(clean, monkeypatch,
+                                                           collected_sends):
+    store, file_id = _store_with_video()
+    db.set_store_forcejoin(store["id"], "@store_only")
+
+    async def unknown(user_id, store_id=None):
+        return {"ok": True, "missing": [], "skipped": 1, "checked": 0}
+
+    monkeypatch.setattr(forcejoin, "check_many", unknown)
+    gate = await flow.gate_check(USER_ID, store["id"])
+    assert gate["ok"] is True                            # never lock a buyer out
+
+
+def test_global_and_store_targets_are_merged(clean):
+    from app.services import settings
+    store, _file_id = _store_with_video()
+    settings.set("FORCE_CHANNEL", "@global_channel")
+    settings.set("FORCE_JOIN_EXTRA", "@extra_one\nhttps://t.me/+AbCdEfGhIjK")
+    db.set_store_forcejoin(store["id"], "@store_only")
+
+    refs = {t["ref"] for t in forcejoin.targets(store["id"])}
+    assert "@global_channel" in refs
+    assert "@extra_one" in refs
+    assert "https://t.me/+AbCdEfGhIjK" in refs
+    assert "@store_only" in refs
+    # …and a different store does not inherit this store's channel
+    other = db.create_store(ADMIN_ID, "Other")
+    refs_other = {t["ref"] for t in forcejoin.targets(other["id"])}
+    assert "@store_only" not in refs_other
+    settings.reset("FORCE_JOIN_EXTRA")
+    settings.reset("FORCE_CHANNEL")
+
+
+def test_gate_keyboard_has_one_join_button_per_channel():
+    rows = forcejoin.gate_keyboard(USER_ID, 7, [
+        {"ref": "@a_channel", "title": "A", "invite": "https://t.me/a_channel"},
+        {"ref": "@b_channel", "title": "B", "invite": "https://t.me/b_channel"},
+    ], token="tok123")
+    assert len(rows) == 3                                # two channels + re-check
+    assert all(len(row) == 1 for row in rows)
+
+
+# ------------------------------------------------------------------- analytics
+def test_events_are_recorded_and_aggregated_per_user(clean):
+    store, file_id = _store_with_video()
+    db.log_event("start", USER_ID, None, None, "start")
+    db.log_event("open_store", USER_ID, store["id"], None, store["slug"])
+    db.log_event("deliver", USER_ID, store["id"], file_id, "button")
+    db.log_event("pay_start", USER_ID, store["id"], None, "plan:1")
+    db.log_event("paid", USER_ID, store["id"], None, "plan:1")
+
+    stats = db.user_analytics(USER_ID)
+    assert stats["counts"]["start"] == 1
+    assert stats["counts"]["deliver"] == 1
+    assert stats["videos"][0]["id"] == file_id
+    assert stats["stores"][0]["id"] == store["id"]
+
+
+def test_store_analytics_shows_who_watched_what(clean):
+    store, file_id = _store_with_video()
+    other = db.create_store(ADMIN_ID, "Second")
+    db.touch_user(777, "Second user", "second")
+    db.log_event("open_store", USER_ID, store["id"], None, "x")
+    db.log_event("deliver", USER_ID, store["id"], file_id, "x")
+    db.log_event("deliver", 777, store["id"], file_id, "x")
+
+    stats = db.store_analytics(store["id"])
+    assert stats["counts"]["deliver"] == 2
+    watchers = {row["user_id"] for row in stats["watchers"]}
+    assert watchers == {USER_ID, 777}
+    file_row = next(f for f in stats["files"] if f["id"] == file_id)
+    assert file_row["uniq"] == 2 and file_row["sends"] == 2
+    others = db.store_analytics(other["id"])
+    assert others["counts"] == {}
+
+
+def test_funnel_counts_came_watched_paid(clean):
+    store, file_id = _store_with_video()
+    db.log_event("open_store", USER_ID, store["id"], None, "x")
+    db.log_event("deliver", USER_ID, store["id"], file_id, "x")
+    db.log_event("paid", USER_ID, store["id"], None, "plan:1")
+    db.log_event("open_store", 777, store["id"], None, "x")
+    funnel = db.store_funnel(store["id"])
+    assert funnel == {"came": 2, "watched": 1, "joined": 0, "paid": 1}
+
+
+def test_file_watchers_list(clean):
+    store, file_id = _store_with_video()
+    db.log_event("deliver", USER_ID, store["id"], file_id, "x")
+    db.log_event("deliver", USER_ID, store["id"], file_id, "x")
+    rows = db.file_watchers(file_id)
+    assert rows[0]["user_id"] == USER_ID and rows[0]["hits"] == 2
+    assert db.unique_viewers(file_id) == 1
+
+
+# -------------------------------------------------------- mirror & delivery fix
+def test_mirror_targets_prefers_the_cached_copy(clean):
+    from app.services.sender import event_chat_id
+    store, file_id = _store_with_video()
+    row = db.file(file_id)
+    from app.services.media_cache import mirror_targets
+    assert mirror_targets(row)[0] == (ADMIN_ID, 500)
+    assert db.count_mirrors() == 1
+    db.clear_mirror(file_id)
+    assert db.file(file_id)["mirror_msg"] is None
+    assert event_chat_id(SimpleNamespace(chat_id=77)) == 77
+
+
+@pytest.mark.asyncio
+async def test_deliver_uses_the_mirror_first(clean, monkeypatch):
+    from app.services import sender
+    store, file_id = _store_with_video()
+    row = db.file(file_id)
+    fetched: list[tuple] = []
+
+    class Bot:
+        async def get_messages(self, chat_id, ids=None, **_kw):
+            fetched.append((chat_id, ids))
+            return SimpleNamespace(media=object())
+
+    async def fake_send_media(chat_id, media, caption_text, buttons=None):
+        fetched.append(("sent", chat_id))
+
+    monkeypatch.setattr(sender, "bot", Bot())
+    monkeypatch.setattr(sender, "_send_media", fake_send_media)
+    result = await sender.deliver(USER_ID, row)
+    assert result.ok
+    assert fetched == [(ADMIN_ID, 500), ("sent", USER_ID)]
+
+
+def test_media_cache_stats(clean):
+    from app.services.media_cache import stats
+    store, file_id = _store_with_video()
+    db.add_file(store["id"], "Second", "Video", -100, 11)
+    assert stats() == {"files": 2, "mirrored": 1, "missing": 1}
+
+
+# --------------------------------------------------------------------- broadcast
+def test_campaign_buttons_include_the_online_button(clean):
+    store, file_id = _store_with_video()
+    campaign = broadcast.create_campaign(
+        ADMIN_ID, text="hi", audience="all", files=[file_id], start=False,
+        buttons="📢 Join | https://t.me/mychannel", online_button=1)
+    from app.services import settings
+    settings.set("BROADCAST_SEND_ONLINE_BUTTON", True)
+    rows = broadcast.campaign_buttons(campaign)
+    labels = [label for row in rows for label, _url in row]
+    assert any("অনলাইন" in label for label in labels)
+    assert any("Join" in label for label in labels)
+    assert broadcast.online_button_url(campaign).startswith("https://t.me/")
+
+
+def test_campaign_buttons_respect_the_switch(clean):
+    """Both the per-campaign switch and the global default must work."""
+    from app.services import settings
+    store, file_id = _store_with_video()
+    off = broadcast.create_campaign(ADMIN_ID, text="hi", files=[file_id], start=False,
+                                    online_button=0)
+    labels = [label for row in broadcast.campaign_buttons(off) for label, _ in row]
+    assert not any("অনলাইন" in label for label in labels)
+
+    settings.set("BROADCAST_SEND_ONLINE_BUTTON", False)
+    follows_global = broadcast.create_campaign(ADMIN_ID, text="hi", files=[file_id],
+                                               start=False)      # no explicit choice
+    assert not any("অনলাইন" in label
+                   for row in broadcast.campaign_buttons(follows_global) for label, _ in row)
+    settings.reset("BROADCAST_SEND_ONLINE_BUTTON")
+
+
+@pytest.mark.asyncio
+async def test_media_campaign_really_sends_media_to_a_normal_user(clean, monkeypatch):
+    """The bug the owner reported: only the admin got the test message."""
+    from app.services import sender
+    store, file_id = _store_with_video()
+    campaign = broadcast.create_campaign(ADMIN_ID, text="New!", audience="all",
+                                         files=[file_id], start=False)
+    delivered: list[tuple] = []
+
+    async def fake_deliver_file_id(chat_id, file_id_arg, caption_text=None, buttons=None):
+        from app.services.sender import Delivery
+        delivered.append((chat_id, file_id_arg, buttons))
+        return Delivery(True)
+
+    async def fake_ensure_ready(row):
+        return row
+
+    monkeypatch.setattr(sender, "deliver_file_id", fake_deliver_file_id)
+    monkeypatch.setattr(sender, "ensure_ready", fake_ensure_ready)
+    await broadcast._send_to_user(campaign, USER_ID)
+    assert delivered and delivered[0][0] == USER_ID and delivered[0][1] == file_id
+    assert delivered[0][2], "inline buttons (online button) must be attached"
+
+
+@pytest.mark.asyncio
+async def test_campaign_with_dead_file_fails_loudly(clean, monkeypatch):
+    from app.services import sender
+    store, file_id = _store_with_video()
+    db.clear_mirror(file_id)
+    campaign = broadcast.create_campaign(ADMIN_ID, text="New!", audience="all",
+                                         files=[file_id], start=False)
+
+    async def fake_ensure_ready(row):
+        return row                                  # mirror impossible
+
+    async def fake_deliver_file_id(chat_id, file_id_arg, caption_text=None, buttons=None):
+        from app.services.sender import Delivery
+        return Delivery(False, "no_session", "no userbot session")
+
+    monkeypatch.setattr(sender, "ensure_ready", fake_ensure_ready)
+    monkeypatch.setattr(sender, "deliver_file_id", fake_deliver_file_id)
+    with pytest.raises(RuntimeError):
+        await broadcast._send_to_user(campaign, USER_ID)
+
+
+def test_audience_never_includes_admins(clean):
+    store, _file_id = _store_with_video()
+    db.touch_user(1234, "Normal", "normal")
+    targets = broadcast.resolve_audience(ADMIN_ID, "all")
+    assert ADMIN_ID not in targets and 1234 in targets
+
+
+def test_text_campaign_personalises(clean):
+    campaign = broadcast.create_campaign(ADMIN_ID, text="হ্যালো {name}", start=False)
+    assert broadcast.preview(campaign, "Rahim") == "হ্যালো Rahim"
+
+
+# --------------------------------------------------------------- channel posts
+def test_parse_button_spec_builds_buttons_and_rows():
+    from app.utils import parse_button_spec
+    rows = parse_button_spec("📢 Join | https://t.me/mychannel\n"
+                             "🛒 Store | https://t.me/bot?start=s1 && 💬 Admin | https://t.me/admin")
+    assert rows[0] == [("📢 Join", "https://t.me/mychannel")]
+    assert len(rows[1]) == 2
+    assert parse_button_spec("no link here") == []
+
+
+def test_composer_defaults_offer_a_store_button(clean):
+    store, _file_id = _store_with_video()
+    runtime.bot_username = "test_bot"
+    payload = channels.composer_defaults(store["id"])
+    assert store["name"] in payload["text"]
+    assert "start=" in payload["buttons"]
+
+
+@pytest.mark.asyncio
+async def test_publish_posts_text_with_buttons(clean, monkeypatch):
+    runtime.bot_username = "test_bot"
+    sent: list[tuple] = []
+
+    async def fake_send_text(peer, text, buttons=None, link_preview=False):
+        sent.append((peer, text, buttons))
+        return SimpleNamespace(id=321)
+
+    monkeypatch.setattr(channels, "send_text", fake_send_text)
+    result = await channels.publish(-100123456, text="নতুন ভিডিও",
+                                    buttons="🟢 খুলুন | https://t.me/test_bot?start=s1")
+    assert result["ok"] and result["message_id"] == 321
+    assert sent[0][0] == -100123456
+    labels = [label for label, _url in sent[0][2][0]]
+    assert any("খুলুন" in label for label in labels)
+
+
+@pytest.mark.asyncio
+async def test_publish_with_files_uses_the_delivery_engine(clean, monkeypatch):
+    store, file_id = _store_with_video()
+    calls: list[tuple] = []
+
+    async def fake_deliver(peer, row, caption=None, buttons=None):
+        from app.services.sender import Delivery
+        calls.append((peer, row["id"], caption, buttons))
+        return Delivery(True)
+
+    monkeypatch.setattr(channels, "deliver", fake_deliver)
+    result = await channels.publish(-100999, text="Episode", file_ids=[file_id],
+                                    buttons="🎬 দেখুন | https://t.me/test_bot?start=f1")
+    assert result["ok"] and result["sent"] == 1
+    assert calls[0][1] == file_id and calls[0][3]
+
+
+@pytest.mark.asyncio
+async def test_publish_without_content_is_rejected(clean):
+    result = await channels.publish(-100999, text="", file_ids=[])
+    assert result["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_channel_footer_is_appended(clean, monkeypatch):
+    from app.services import settings
+    settings.set("CHANNEL_POST_FOOTER", "— Ahad Store")
+    sent: list[tuple] = []
+
+    async def fake_send_text(peer, text, buttons=None, link_preview=False):
+        sent.append((peer, text))
+        return SimpleNamespace(id=1)
+
+    monkeypatch.setattr(channels, "send_text", fake_send_text)
+    await channels.publish(-1001, text="Hello", buttons="")
+    assert "Ahad Store" in sent[0][1]
+    settings.reset("CHANNEL_POST_FOOTER")
+
+
+def test_list_channels_merges_sources(clean):
+    import asyncio
+    store, _file_id = _store_with_video()
+    db.set_store_forcejoin(store["id"], "@store_only")
+    db.add_join_channel(None, "@global_one", title="Global One")
+    db.add_bot_chat(-100777, "Scanned channel")
+    listed = asyncio.run(_list_channels())
+    refs = {row["ref"] for row in listed}
+    assert "@global_one" in refs
+    assert str(-100777) in refs or -100777 in {row["chat_id"] for row in listed}
+
+
+async def _list_channels():
+    return await channels.list_channels()
+
+
+# ================================================ bot-side v3 screens (dispatch)
+@pytest.fixture()
+def bot_state(tmp_path, monkeypatch):
+    from tests.test_flows import FakeEvent  # noqa: F401 — same harness as the flow tests
+    db.bind(str(tmp_path / "botv3.sqlite3"))
+    monkeypatch.setattr(cfg, "ADMIN_IDS", [ADMIN_ID])
+    runtime.bot_username = "test_bot"
+    state.pending_input.clear()
+    state.flow_ctx.clear()
+    state.batch_mode.clear()
+    state.search_pending.clear()
+    db.touch_user(ADMIN_ID, "Owner", "owner")
+    db.touch_user(USER_ID, "Tester", "tester")
+    return monkeypatch
+
+
+@pytest.mark.asyncio
+async def test_bot_channels_screen_lists_channels(bot_state):
+    from app.handlers.router import dispatch
+    from tests.test_flows import FakeEvent
+    db.add_join_channel(None, "@my_channel", title="My channel", chat_id=-100999)
+    event = FakeEvent(ADMIN_ID, data=b"ch:home")
+    await dispatch(event)
+    assert event.edits and "চ্যানেল ম্যানেজমেন্ট" in event.edits[-1][0]
+    labels = [btn.text for row in event.edits[-1][1] for btn in row]
+    assert any("My channel" in label for label in labels)
+
+
+@pytest.mark.asyncio
+async def test_bot_add_channel_flow_creates_the_channel(bot_state, monkeypatch):
+    from app.handlers import messages as messages_module
+    from app.handlers.state import ask, pending_input as _pi  # noqa: F401
+    from tests.test_flows import FakeEvent
+    from app.services import channels as channels_service
+
+    async def fake_add(ref, store_id=None, title=""):
+        return {"ok": True, "id": 5, "chat_id": -100321, "title": "Typed channel"}
+    monkeypatch.setattr(channels_service, "add_channel", fake_add)
+    monkeypatch.setattr(messages_module, "channels", channels_service, raising=False)
+    ask(ADMIN_ID, "add_channel")
+    event = FakeEvent(ADMIN_ID, text="@typed_channel")
+    await messages_module.pending_input(event)
+    assert any("যোগ হয়েছে" in (text or "") for text, _ in event.sent)
+
+
+@pytest.mark.asyncio
+async def test_bot_limited_link_flow(bot_state):
+    from app.handlers import messages as messages_module
+    from app.handlers.state import ask
+    from tests.test_flows import FakeEvent
+    store, file_id = _store_with_video()
+    db.set_active_store(ADMIN_ID, store["id"])
+    ask(ADMIN_ID, "link_limit", file_id=file_id)
+    event = FakeEvent(ADMIN_ID, text="100")
+    await messages_module.pending_input(event)
+    links = db.links(limit=5)
+    assert links and links[0]["max_clicks"] == 100
+    assert db.link_file_ids(links[0]["token"]) == [file_id]
+    assert any("লিংক তৈরি" in (text or "") for text, _ in event.sent)
+
+
+@pytest.mark.asyncio
+async def test_bot_store_forcejoin_flow(bot_state):
+    from app.handlers import messages as messages_module
+    from app.handlers.state import ask
+    from tests.test_flows import FakeEvent
+    store, _file_id = _store_with_video()
+    ask(ADMIN_ID, "store_forcejoin", store_id=store["id"])
+    event = FakeEvent(ADMIN_ID, text="https://t.me/+AbCdEfGhIjK")
+    await messages_module.pending_input(event)
+    assert db.store_forcejoin(store["id"]) == "https://t.me/+AbCdEfGhIjK"
+    assert "https://t.me/+AbCdEfGhIjK" in {t["ref"] for t in forcejoin.targets(store["id"])}
+
+
+@pytest.mark.asyncio
+async def test_bot_analytics_screens(bot_state):
+    from app.handlers.router import dispatch
+    from tests.test_flows import FakeEvent
+    store, file_id = _store_with_video()
+    db.touch_user(777, "Watcher", "watcher")
+    db.log_event("deliver", USER_ID, store["id"], file_id, "button")
+    db.log_event("paid", USER_ID, store["id"], None, "plan:1")
+
+    event = FakeEvent(ADMIN_ID, data=b"an:home")
+    await dispatch(event)
+    assert "অ্যানালিটিক্স" in event.edits[-1][0]
+
+    event = FakeEvent(ADMIN_ID, data=f"an:store:{store['id']}".encode())
+    await dispatch(event)
+    assert "ভিডিও দেখেছে" in event.edits[-1][0]
+
+    event = FakeEvent(ADMIN_ID, data=f"an:file:{file_id}".encode())
+    await dispatch(event)
+    assert "যারা পেয়েছে" in event.edits[-1][0]
+    assert "Tester" in event.edits[-1][0]
+
+
+@pytest.mark.asyncio
+async def test_join_confirm_button_delivers_the_video(bot_state, monkeypatch, collected_sends,
+                                                      recorded_deliveries):
+    from app.handlers.router import dispatch
+    from tests.test_flows import FakeEvent
+    store, file_id = _store_with_video()
+    db.set_store_forcejoin(store["id"], "@store_only")
+
+    async def joined(user_id, store_id=None):
+        return {"ok": True, "missing": [], "skipped": 0, "checked": 1}
+
+    monkeypatch.setattr(forcejoin, "check_many", joined)
+    event = FakeEvent(USER_ID, data=f"fj:{USER_ID}:{file_id}".encode())
+    await dispatch(event)
+    assert recorded_deliveries == [(USER_ID, file_id)]
+
+
+@pytest.mark.asyncio
+async def test_limited_link_click_refuses_after_the_limit(bot_state, monkeypatch,
+                                                          collected_sends,
+                                                          recorded_deliveries):
+    store, file_id = _store_with_video()
+    token = db.create_link(ADMIN_ID, [file_id], None, kind="limited", max_clicks=1)
+
+    event = GateEvent(USER_ID)
+    assert await flow.open_link(event, token) == flow.GATE_OK
+    assert recorded_deliveries == [(USER_ID, file_id)]
+
+    after = GateEvent(USER_ID)
+    assert await flow.open_link(after, token) == flow.GATE_LIMIT
+    assert "লিমিট" in collected_sends[-1][1]
+    assert recorded_deliveries == [(USER_ID, file_id)]          # nothing more sent
+    assert db.events(name="limit_block", user_id=USER_ID)

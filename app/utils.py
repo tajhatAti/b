@@ -159,3 +159,81 @@ def unique_keep_order(items: Iterable[T]) -> list[T]:
         seen.add(item)
         out.append(item)
     return out
+
+
+def parse_button_spec(spec: str) -> list[list[tuple[str, str]]]:
+    """Turn the admin's button text into rows of (label, url).
+
+    One button per line as `label | url`; put `&&` between buttons to keep them
+    on the same row::
+
+        📢 Join channel | https://t.me/mychannel
+        🛒 Store | https://t.me/mybot?start=s1 && 💬 Admin | https://t.me/admin
+
+    Lines without a link are ignored, so a stray line never breaks a broadcast.
+    """
+    rows: list[list[tuple[str, str]]] = []
+    for raw_line in (spec or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        row: list[tuple[str, str]] = []
+        for part in line.split("&&"):
+            part = part.strip()
+            if not part:
+                continue
+            if "|" in part:
+                label, _, url = part.partition("|")
+                label, url = label.strip(), url.strip()
+            else:
+                tokens = part.rsplit(None, 1)
+                if len(tokens) == 2 and tokens[1].startswith(("http://", "https://", "tg://")):
+                    label, url = tokens[0].strip(), tokens[1].strip()
+                else:
+                    label, url = "", part.split()[-1] if part.split() else ""
+            if not url.startswith(("http://", "https://", "tg://")):
+                continue
+            row.append((label[:60] or "🔗", url))
+        if row:
+            rows.append(row)
+    return rows
+
+
+def button_rows(buttons):
+    """Build a TL inline keyboard from ([label, url] | [label, data] | Button).
+
+    Works both with plain pairs from `parse_button_spec()` and with ready-made
+    Telethon `Button` objects.
+    """
+    if not buttons:
+        return None
+    try:
+        from telethon.tl.custom import Button
+        from telethon.tl.types import KeyboardInlineButtonRow, ReplyInlineMarkup
+    except Exception:                                     # pragma: no cover
+        return None
+
+    def as_button(item):
+        """Accept a ready Button, a raw KeyboardInlineButton or a (label, value) pair."""
+        if hasattr(item, "text") and hasattr(item, "type"):
+            return item                                    # already a TL button
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            label, value = str(item[0])[:60], str(item[1])
+            if value.startswith(("http://", "https://", "tg://")):
+                return Button.url(label, value)
+            return Button.inline(label, value.encode())
+        return None
+
+    if hasattr(buttons, "text") and hasattr(buttons, "type"):
+        buttons = [buttons]                                # a single button
+    rows = []
+    for row in buttons:
+        if hasattr(row, "text") and hasattr(row, "type"):
+            row = [row]
+        elif isinstance(row, (list, tuple)) and len(row) == 2 \
+                and isinstance(row[0], str) and isinstance(row[1], str):
+            row = [row]                                   # a bare (label, value) pair
+        built = [b for b in (as_button(item) for item in row) if b is not None]
+        if built:
+            rows.append(KeyboardInlineButtonRow(built))
+    return ReplyInlineMarkup(rows) if rows else None

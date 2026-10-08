@@ -106,7 +106,7 @@ def main() -> int:
     from importlib import import_module
     for module_name in ("app.handlers.admin", "app.handlers.billing",
                         "app.handlers.extras", "app.handlers.inline",
-                        "app.handlers.manage", "app.handlers.messages",
+                        "app.handlers.manage", "app.handlers.messages", "app.handlers.panel_v3",
                         "app.handlers.user"):
         import_module(module_name)
 

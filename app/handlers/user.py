@@ -12,7 +12,7 @@ from app.handlers.router import route
 from app.handlers.state import search_pending
 from app.logger import log
 from app.runtime import bot
-from app.services import access
+from app.services import access, flow
 from app.services.sender import deliver
 from app.storage import db
 from app.utils import esc, safe_int
@@ -45,31 +45,9 @@ async def apply_referral(user_id: int, referrer_id: int, is_new: bool) -> None:
 
 
 async def deliver_link_token(event, user_id: int, token: str) -> None:
-    row = db.link(token)
-    if row is None:
-        await event.respond("⚠️ This link is invalid or was removed.")
-        return
-    if row["expires_at"] and time.time() > row["expires_at"]:
-        db.delete_link(token)
-        await event.respond("⌛ <b>This link has expired.</b>")
-        return
-    if not await ui.require_membership(event, user_id):
-        return
-    file_ids = db.link_file_ids(token)
-    if not file_ids:
-        await event.respond("⚠️ This link has no files any more.")
-        return
-    await event.respond(f"📦 Sending {len(file_ids)} file(s)…")
-    sent = 0
-    for file_id in file_ids:
-        file_row = db.file(file_id)
-        if file_row is None:
-            continue
-        result = await deliver(event.chat_id, file_row)
-        sent += 1 if result.ok else 0
-        await asyncio.sleep(0.4)
-    if not sent:
-        await event.respond(texts.NOT_FOUND)
+    """Kept for old call sites — the real work lives in `flow.open_link`
+    (click limits, per-store gate and analytics all happen there)."""
+    await flow.open_link(event, token)
 
 
 async def handle_payload(event, user_id: int, payload: str, is_new: bool) -> bool:
@@ -84,15 +62,13 @@ async def handle_payload(event, user_id: int, payload: str, is_new: bool) -> boo
         return False                      # fall through to the normal home screen
 
     if kind == KIND_FILE:
-        await ui.deliver_to_user(event, user_id, db.file(int(value)))
+        # One tap: the video goes out right here (gate first, if a channel is set).
+        await flow.open_file(event, int(value), ref="start")
         return True
 
     if kind == KIND_STORE:
-        store = db.store(int(value))
-        if store is None:
+        if not await flow.open_store(event, int(value), 0, edit=False):
             await event.respond("⚠️ This store no longer exists.")
-            return True
-        await ui.show_store(event, store, 0, edit=False)
         return True
 
     if kind == KIND_SLUG:
@@ -100,11 +76,11 @@ async def handle_payload(event, user_id: int, payload: str, is_new: bool) -> boo
         if store is None:
             await event.respond("⚠️ This store link is invalid or the store was deleted.")
             return True
-        await ui.show_store(event, store, 0, edit=False)
+        await flow.open_store(event, store["id"], 0, edit=False)
         return True
 
     if kind == KIND_LINK:
-        await deliver_link_token(event, user_id, str(value))
+        await flow.open_link(event, str(value))
         return True
 
     if kind == KIND_LEGACY_BATCH:
@@ -113,26 +89,30 @@ async def handle_payload(event, user_id: int, payload: str, is_new: bool) -> boo
         if not file_rows:
             await event.respond(texts.NOT_FOUND)
             return True
-        if not await ui.require_membership(event, user_id):
+        if not (await flow.gate_check(user_id, file_rows[0]["store_id"]))["ok"]:
+            await flow.show_join_gate(event, user_id, file_rows[0],
+                                      (await flow.gate_check(user_id, file_rows[0]["store_id"]))["missing"])
             return True
-        await event.respond(f"📦 Sending {len(file_rows)} file(s)…")
+        await event.respond(f"📦 পাঠাতে শুরু করলাম — মোট <b>{len(file_rows)}</b> টি ফাইল…")
         for row in file_rows:
-            await deliver(event.chat_id, row)
+            state = await flow.open_file(event, row["id"], ref="batch")
+            if state == flow.GATE_JOIN:
+                return True
             await asyncio.sleep(0.4)
         return True
 
     if kind == KIND_CODE:
-        file_row = db.file_by_code(str(value))
+        file_row = db.file_by_code(str(value)) or db.file_by_uid(str(value))
         if file_row:
-            await ui.deliver_to_user(event, user_id, file_row)
+            await flow.open_file(event, file_row["id"], ref="code")
             return True
         store = db.store_by_slug(str(value))
         if store:
-            await ui.show_store(event, store, 0, edit=False)
+            await flow.open_store(event, store["id"], 0, edit=False)
             return True
         link = db.link(str(value))
         if link:
-            await deliver_link_token(event, user_id, str(value))
+            await flow.open_link(event, str(value))
             return True
         await event.respond("⚠️ This link is invalid or the content was removed.")
         return True
@@ -211,6 +191,9 @@ async def show_home(event, user_id: int, edit: bool = False):
 async def start_handler(event: events.NewMessage.Event) -> None:
     user_id = event.sender_id
     sender = await event.get_sender()
+    db.log_event("start", user_id, None, None,
+                 (event.raw_text or "").split(maxsplit=1)[1][:40]
+                 if len((event.raw_text or "").split(maxsplit=1)) > 1 else "start")
     is_new = db.touch_user(user_id,
                            getattr(sender, "first_name", None),
                            getattr(sender, "username", None))
@@ -314,7 +297,7 @@ async def open_store(event, rest: str) -> None:
         await ui.render(event, text, paywall_buttons(event, store, user_id), edit=True)
         await event.answer()
         return
-    await ui.show_store(event, store, 0, edit=True)
+    await flow.open_store(event, store["id"], 0, edit=True)
     await event.answer()
 
 
@@ -371,10 +354,40 @@ async def receive_file(event, rest: str) -> None:
     if file_row is None:
         await event.answer("This file was removed.", alert=True)
         return
-    sent = await ui.deliver_to_user(event, user_id, file_row)
-    await event.answer("✅ Sent!" if sent else "")
-    if sent:
-        await ui.strip_button(event, event.data)
+    state = await flow.open_file(event, file_row["id"], ref="button")
+    if state == flow.GATE_JOIN:
+        await event.answer("🔐 আগে চ্যানেল জয়েন করুন", alert=True)
+        return
+    if state != flow.GATE_OK:
+        await event.answer("")
+        return
+    await event.answer("✅ ভিডিও পাঠানো হয়েছে!")
+    await ui.strip_button(event, event.data)
+
+
+@route("fj:")
+async def join_confirm(event, rest: str) -> None:
+    """“✅ আমি জয়েন করেছি” — re-check the channels and give the file right away."""
+    parts = (rest or "").split(":")
+    if len(parts) < 2:
+        await event.answer("⚠️ পুরনো বাটন — লিংকটি আবার খুলুন", alert=True)
+        return
+    owner_id, file_id = safe_int(parts[0]), safe_int(parts[1])
+    token = parts[2] if len(parts) > 2 else ""
+    if owner_id and owner_id != event.sender_id:
+        await event.answer("এই বাটনটি আপনার জন্য নয় 🙂", alert=True)
+        return
+    await event.answer("🔎 চেক করছি…")
+    await flow.confirm_join(event, event.sender_id, file_id, token)
+
+
+@route("ul:")
+async def open_limited_link(event, rest: str) -> None:
+    """Close the loop of a limited link posted in a channel."""
+    await event.answer("🔓 খুলছি…")
+    state = await flow.open_link(event, rest.split(":")[0])
+    if state == flow.GATE_JOIN:
+        await event.answer("🔐 আগে চ্যানেল জয়েন করুন", alert=True)
 
 
 # ------------------------------------------------- bottom (reply) keyboard (v2.3)

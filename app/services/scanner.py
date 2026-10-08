@@ -34,24 +34,21 @@ def start_scan(admin_id: int) -> None:
 
 
 def _kind_of(message) -> str | None:
-    if getattr(message, "video", None):
-        return "Video"
-    if getattr(message, "photo", None):
-        return "Photo"
-    if getattr(message, "audio", None):
-        return "Audio"
-    if getattr(message, "document", None):
-        return "Document"
-    return None
+    """Same strict rule as manual uploads: video + photo only, nothing else."""
+    from app.services.media_guard import classify
+    kind, _reason = classify(message)
+    return kind
 
 
 def _store_message(store_id: int, title: str, chat_id: int, message, index: int) -> bool:
     kind = _kind_of(message)
     if kind is None:
         return False
+    caption = (getattr(message, "message", "") or "").strip().splitlines()
+    name = (caption[0].strip()[:60] if caption else "") or f"{title[:20]} #{index}"
     file_id = db.add_file(
         store_id=store_id,
-        name=f"{title[:20]} #{index}",
+        name=name,
         kind=kind,
         chat_id=chat_id,
         msg_id=message.id,
@@ -59,6 +56,8 @@ def _store_message(store_id: int, title: str, chat_id: int, message, index: int)
         size=getattr(getattr(message, "file", None), "size", None),
         duration=getattr(getattr(message, "video", None), "duration", None),
     )
+    if file_id is not None:
+        db.set_file_uid(file_id, f"{file_id}x{int(message.id) % 100000:05d}")
     return file_id is not None
 
 
@@ -81,6 +80,9 @@ async def _run(admin_id: int, iterator, title: str, chat_id: int, store_id: int,
         raise
     finally:
         SCANS.pop(admin_id, None)
+    if found:
+        db.log_event("scan", admin_id, store_id, None, str(chat_id),
+                     f"scanned={scanned} found={found}")
     return {"scanned": scanned, "found": found, "title": title, "store_id": store_id}
 
 

@@ -71,6 +71,12 @@ REGISTRY: list[Group] = [
                hint="প্রাইভেট চ্যানেল হলে ইনভাইট লিংক দিন — বট সেই লিংক থেকে চ্যানেল খুঁজে নেবে"),
             _s("FORCE_JOIN_NOTE", "জয়েন করার সময় ইউজারকে যা দেখাবে", "force_join",
                kind="long", hint="যেমন: জয়েন করে আবার /start দিন"),
+            _s("FORCE_JOIN_ALWAYS", "সব স্টোরে ডিফল্ট চ্যানেলও বাধ্যতামূলক", "force_join",
+               kind="bool", default=True,
+               hint="বন্ধ করলে স্টোর-ভিত্তিক চ্যানেল আলাদা থাকবে"),
+            _s("FORCE_JOIN_EXTRA", "ডিফল্ট চ্যানেলের সাথে যুক্ত আরও চ্যানেল", "force_join",
+               kind="long", placeholder="@channel1, https://t.me/+AbCdEfGh",
+               hint="কমা/নতুন লাইনে আলাদা করুন — সবগুলোতেই জয়েন করতে হবে"),
         ],
     ),
     Group(
@@ -113,6 +119,23 @@ REGISTRY: list[Group] = [
                hint="{name} দিলে ফাইলের নাম বসবে"),
             _s("DEFAULT_LANG", "ডিফল্ট ভাষা", "content", default="bn",
                placeholder="bn অথবা en"),
+            _s("CONTENT_MEDIA_KINDS", "স্টোরে কী কী গ্রহণযোগ্য", "content",
+               default="video,photo",
+               hint="ডিফল্ট: video,photo — টেক্সট কখনোই সেভ হয় না"),
+            _s("LINK_DEFAULT_LIMIT", "লিমিটেড লিংকের ডিফল্ট ক্লিক", "content",
+               kind="int", default=100,
+               hint="0 = আনলিমিটেড; লিংক বানানোর সময় আলাদাভাবে বদলানো যায়"),
+            _s("BROADCAST_SEND_ONLINE_BUTTON", "ব্রডকাস্টে “অনলাইন” বাটন যোগ করুন",
+               "content", kind="bool", default=True,
+               hint="মেসেজের নিচে স্টোর খোলার ইনলাইন বাটন বসবে"),
+            _s("DELIVER_FORMAT_SEPARATOR", "প্রতিটি ফাইলের আগে আলাদা মেসেজ",
+               "content", kind="bool", default=False),
+            _s("STORAGE_CHANNEL", "মিডিয়া ক্যাশ চ্যানেল (ঐচ্ছিক)", "content",
+               placeholder="@my_storage অথবা -1001234567890",
+               hint="এখানে একবার করে ফাইল কপি হয় — তারপর সব ইউজার সরাসরি বট থেকে পায়"),
+            _s("MIRROR_MAX_MB", "ক্যাশ করার সর্বোচ্চ ফাইল সাইজ (MB)", "content",
+               kind="int", default=1900,
+               hint="এর চেয়ে বড় ফাইল বট সরাসরি পাঠাবে না (সেশন লাগবে)"),
         ],
     ),
     Group(
@@ -129,6 +152,18 @@ REGISTRY: list[Group] = [
                kind="int", default=5),
             _s("BROADCAST_AUTO_RESUME", "রিস্টার্টের পর অসমাপ্ত ব্রডকাস্ট চালু করবে",
                "broadcast", kind="bool", default=True),
+            _s("BROADCAST_REACH_DAYS", "কত দিন সক্রিয় ইউজারকে পাঠাবে", "broadcast",
+               kind="int", default=0,
+               hint="0 = সব ইউজার (ব্লক করা বাদে)"),
+            _s("BROADCAST_TO_BLOCKED", "ব্লক করা ইউজারকেও আবার চেষ্টা করবে",
+               "broadcast", kind="bool", default=False),
+            _s("BROADCAST_ONLINE_LABEL", "“অনলাইন” বাটনের লেখা", "broadcast",
+               default="🟢 অনলাইন — স্টোর খুলুন"),
+            _s("BROADCAST_DEFAULT_BUTTONS", "ব্রডকাস্টের ডিফল্ট বাটন", "broadcast",
+               kind="long", placeholder="📢 জয়েন | https://t.me/mychannel",
+               hint="প্রতি লাইনে একটা: লেবেল | লিংক  ·  একই লাইনে && দিলে পাশাপাশি"),
+            _s("CHANNEL_POST_FOOTER", "চ্যানেল পোস্টের নিচের লেখা", "broadcast",
+               kind="long", hint="প্রতিটি চ্যানেল পোস্টের শেষে বসবে"),
         ],
     ),
     Group(
@@ -198,7 +233,12 @@ def get(key: str, default: Any = None) -> Any:
     item = _BY_KEY.get(key)
     if item is None:
         return default
-    fallback = item.default if default is None else default
+    # The registry default is the real fallback. `default` is only used when the
+    # registry has nothing either — otherwise every `get_int(...)` call (which
+    # passes 0) would silently wipe out defaults like TRIAL_HOURS = 24.
+    fallback = item.default
+    if fallback in (None, ""):
+        fallback = default
     env_now = _env_value(key, fallback)
     cached = _cache.get(key)
     # The cache also remembers the environment value it was built from, so a

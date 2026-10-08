@@ -256,6 +256,52 @@ CREATE TABLE IF NOT EXISTS campaign_items (
 );
 CREATE INDEX IF NOT EXISTS idx_camp_status ON campaigns(status, scheduled_at);
 CREATE INDEX IF NOT EXISTS idx_camp_items  ON campaign_items(campaign_id, status);
+
+-- ===================== v3: analytics, limited links, per-store force join =====================
+CREATE TABLE IF NOT EXISTS events (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts       REAL,
+    user_id  INTEGER,
+    name     TEXT,                      -- start|open_store|view_file|deliver|join_click|join_block|limit_block|pay_start|paid|cancel|search|broadcast_open
+    store_id INTEGER,
+    file_id  INTEGER,
+    ref      TEXT,                      -- slug / token / campaign id / payload
+    detail   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_events_ts    ON events(ts DESC);
+CREATE INDEX IF NOT EXISTS idx_events_user  ON events(user_id, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_events_file  ON events(file_id, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_events_store ON events(store_id, ts DESC);
+
+CREATE TABLE IF NOT EXISTS join_channels (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    store_id   INTEGER,                 -- NULL = global / default channel
+    ref        TEXT NOT NULL,           -- @username, invite hash or chat id
+    title      TEXT DEFAULT '',
+    chat_id    INTEGER,
+    kind       TEXT DEFAULT '',         -- username|invite|id
+    invite     TEXT DEFAULT '',         -- cached join URL
+    added_at   REAL,
+    last_check REAL,
+    error      TEXT DEFAULT '',
+    enabled    INTEGER DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_jc_store ON join_channels(store_id, id);
+
+CREATE TABLE IF NOT EXISTS join_prompts (
+    user_id  INTEGER NOT NULL,
+    file_id  INTEGER NOT NULL,
+    token    TEXT,
+    attempts INTEGER DEFAULT 0,
+    created  REAL,
+    PRIMARY KEY (user_id, file_id)
+);
+
+CREATE TABLE IF NOT EXISTS file_views (
+    file_id  INTEGER PRIMARY KEY,
+    unique_n INTEGER DEFAULT 0,
+    last_ts  REAL
+);
 """
 
 
@@ -295,6 +341,21 @@ class Database:
             ("users", "lang", "ALTER TABLE users ADD COLUMN lang TEXT DEFAULT 'bn'"),
             ("users", "sort_pref", "ALTER TABLE users ADD COLUMN sort_pref TEXT DEFAULT 'default'"),
             ("orders", "proof", "ALTER TABLE orders ADD COLUMN proof TEXT"),
+            ("campaigns", "buttons", "ALTER TABLE campaigns ADD COLUMN buttons TEXT DEFAULT ''"),
+            ("campaigns", "slug", "ALTER TABLE campaigns ADD COLUMN slug TEXT DEFAULT ''"),
+            ("campaigns", "media_caption", "ALTER TABLE campaigns ADD COLUMN media_caption TEXT DEFAULT 'above'"),
+            ("campaigns", "limit_note", "ALTER TABLE campaigns ADD COLUMN limit_note TEXT DEFAULT ''"),
+            ("campaigns", "online_button", "ALTER TABLE campaigns ADD COLUMN online_button INTEGER DEFAULT 1"),
+            ("links", "max_clicks", "ALTER TABLE links ADD COLUMN max_clicks INTEGER DEFAULT 0"),
+            ("links", "clicks", "ALTER TABLE links ADD COLUMN clicks INTEGER DEFAULT 0"),
+            ("links", "kind2", "ALTER TABLE links ADD COLUMN kind2 TEXT DEFAULT ''"),
+            ("files", "uid", "ALTER TABLE files ADD COLUMN uid TEXT"),
+            ("files", "mirror_chat", "ALTER TABLE files ADD COLUMN mirror_chat INTEGER"),
+            ("files", "mirror_msg", "ALTER TABLE files ADD COLUMN mirror_msg INTEGER"),
+            ("files", "mirror_ts", "ALTER TABLE files ADD COLUMN mirror_ts REAL"),
+            ("files", "bytes", "ALTER TABLE files ADD COLUMN bytes INTEGER"),
+            ("files", "locked", "ALTER TABLE files ADD COLUMN locked INTEGER DEFAULT 0"),
+            ("stores", "forcejoin", "ALTER TABLE stores ADD COLUMN forcejoin TEXT DEFAULT ''"),
         ):
             columns = {row["name"] for row in
                        self.conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -359,6 +420,10 @@ class Database:
     def all_user_ids(self) -> list[int]:
         return [r["user_id"] for r in self._q("SELECT user_id FROM users ORDER BY user_id")]
 
+    def recent_user_ids(self, since: float) -> list[dict]:
+        return [dict(r) for r in self._q(
+            "SELECT user_id FROM users WHERE COALESCE(last_seen, joined_at, 0) >= ?", (since,))]
+
     def user_count(self) -> int:
         return self._one("SELECT COUNT(*) AS c FROM users")["c"]
 
@@ -418,7 +483,7 @@ class Database:
         return [dict(r) for r in self._q("SELECT * FROM stores ORDER BY id")]
 
     def update_store(self, store_id: int, **fields: Any) -> None:
-        allowed = {"name", "slug", "is_premium", "cover", "description"}
+        allowed = {"name", "slug", "is_premium", "cover", "description", "forcejoin"}
         sets, params = [], []
         for key, value in fields.items():
             if key not in allowed:
@@ -552,12 +617,14 @@ class Database:
 
     # ------------------------------------------------------------------- links
     def create_link(self, admin_id: int, file_ids: Iterable[int],
-                    expires_at: float | None, kind: str = "multi") -> str:
+                    expires_at: float | None, kind: str = "multi",
+                    max_clicks: int = 0, note: str = "") -> str:
         from app.utils import new_token
         token = new_token(10)
         self._run(
-            "INSERT INTO links(token, admin_id, kind, created_at, expires_at) VALUES(?, ?, ?, ?, ?)",
-            (token, admin_id, kind, time.time(), expires_at),
+            "INSERT INTO links(token, admin_id, kind, created_at, expires_at, max_clicks, kind2) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?)",
+            (token, admin_id, kind, time.time(), expires_at, max(0, int(max_clicks or 0)), note),
         )
         for fid in unique_keep_order(file_ids):
             self._run("INSERT OR IGNORE INTO link_files(token, file_id) VALUES(?, ?)", (token, fid))
@@ -576,12 +643,49 @@ class Database:
         self._run("DELETE FROM link_files WHERE token = ?", (token,))
         self._run("DELETE FROM links WHERE token = ?", (token,))
 
+    def link_clicks(self, token: str) -> int:
+        row = self._one("SELECT clicks FROM links WHERE token = ?", (token,))
+        return int(row["clicks"] or 0) if row else 0
+
+    def link_take(self, token: str) -> dict:
+        """Consume one click of a link. Atomic — two users clicking at the same
+        moment can never take more units than the link has left."""
+        now = time.time()
+        row = self._one("SELECT * FROM links WHERE token = ?", (token,))
+        if not row:
+            return {"ok": False, "reason": "missing"}
+        info = dict(row)
+        if info.get("expires_at") and info["expires_at"] < now:
+            return {"ok": False, "reason": "expired", "link": info}
+        limit = int(info.get("max_clicks") or 0)
+        cur = self.conn.execute(
+            "UPDATE links SET clicks = clicks + 1 WHERE token = ? AND (max_clicks = 0 OR clicks < max_clicks)",
+            (token,),
+        )
+        if cur.rowcount == 0:
+            return {"ok": False, "reason": "limit", "link": info,
+                    "left": 0, "clicks": int(info.get("clicks") or 0), "limit": limit}
+        self.conn.commit()
+        clicks = self.link_clicks(token)
+        return {"ok": True, "link": info, "clicks": clicks, "limit": limit,
+                "left": max(0, limit - clicks) if limit else -1}
+
     def purge_expired_links(self) -> int:
         now = time.time()
         rows = self._q("SELECT token FROM links WHERE expires_at IS NOT NULL AND expires_at < ?", (now,))
         for row in rows:
             self.delete_link(row["token"])
         return len(rows)
+
+    def links(self, limit: int = 100, admin_id: int | None = None) -> list[dict]:
+        sql = "SELECT * FROM links"
+        params: list[Any] = []
+        if admin_id:
+            sql += " WHERE admin_id = ?"
+            params.append(int(admin_id))
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(int(limit))
+        return [dict(r) for r in self._q(sql, params)]
 
     def link_count(self) -> int:
         return self._one("SELECT COUNT(*) AS c FROM links")["c"]
@@ -995,13 +1099,19 @@ class Database:
     def ticket(self, ticket_id: int) -> dict | None:
         return self._dict(self._one("SELECT * FROM tickets WHERE id = ?", (ticket_id,)))
 
-    def tickets(self, status: str | None = "open", limit: int = 20) -> list[dict]:
+    def tickets(self, status: str | None = "open", limit: int = 20,
+                user_id: int | None = None) -> list[dict]:
+        sql = "SELECT * FROM tickets WHERE 1=1"
+        params: list[Any] = []
         if status:
-            return [dict(r) for r in self._q(
-                "SELECT * FROM tickets WHERE status = ? ORDER BY created_at DESC LIMIT ?",
-                (status, limit))]
-        return [dict(r) for r in self._q(
-            "SELECT * FROM tickets ORDER BY created_at DESC LIMIT ?", (limit,))]
+            sql += " AND status = ?"
+            params.append(status)
+        if user_id:
+            sql += " AND user_id = ?"
+            params.append(int(user_id))
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        return [dict(r) for r in self._q(sql, params)]
 
     def answer_ticket(self, ticket_id: int, admin_id: int, reply: str) -> None:
         self._run(
@@ -1139,6 +1249,298 @@ class Database:
     def disable_auto_sync(self, store_id: int) -> None:
         self._run("UPDATE auto_sync SET enabled = 0 WHERE store_id = ?", (store_id,))
 
+    # ================================================================= v3: events
+    # Every interesting user action lands here, so the admin panel can answer
+    # “who clicked what, who watched which video, how many converted”.
+    def log_event(self, name: str, user_id: int | None = None, store_id: int | None = None,
+                  file_id: int | None = None, ref: str | None = None,
+                  detail: str | None = None) -> None:
+        try:
+            self._run(
+                "INSERT INTO events(ts, user_id, name, store_id, file_id, ref, detail) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?)",
+                (time.time(), user_id, name, store_id, file_id, ref, detail),
+            )
+        except sqlite3.Error:
+            pass
+
+    def events(self, limit: int = 200, user_id: int | None = None,
+               name: str | None = None, store_id: int | None = None,
+               file_id: int | None = None, since: float | None = None) -> list[dict]:
+        sql = ("SELECT e.*, u.name AS user_name, u.username AS user_username, "
+               "f.name AS file_name, s.name AS store_name "
+               "FROM events e LEFT JOIN users u ON u.user_id = e.user_id "
+               "LEFT JOIN files f ON f.id = e.file_id "
+               "LEFT JOIN stores s ON s.id = e.store_id WHERE 1=1")
+        params: list[Any] = []
+        if user_id:
+            sql += " AND e.user_id = ?"; params.append(int(user_id))
+        if name:
+            sql += " AND e.name = ?"; params.append(name)
+        if store_id:
+            sql += " AND e.store_id = ?"; params.append(int(store_id))
+        if file_id:
+            sql += " AND e.file_id = ?"; params.append(int(file_id))
+        if since:
+            sql += " AND e.ts >= ?"; params.append(float(since))
+        sql += " ORDER BY e.ts DESC LIMIT ?"
+        params.append(int(limit))
+        return [dict(r) for r in self._q(sql, params)]
+
+    def event_counts(self, since: float | None = None) -> dict:
+        sql = "SELECT name, COUNT(*) AS c FROM events"
+        params: list[Any] = []
+        if since:
+            sql += " WHERE ts >= ?"; params.append(float(since))
+        sql += " GROUP BY name"
+        return {r["name"]: r["c"] for r in self._q(sql, params)}
+
+    def events_by_day(self, days: int = 14) -> list[dict]:
+        since = time.time() - days * 86400
+        rows = self._q(
+            "SELECT date(ts, 'unixepoch', '+6 hours') AS day, "
+            "SUM(CASE WHEN name = 'start' THEN 1 ELSE 0 END) AS joined, "
+            "SUM(CASE WHEN name = 'deliver' THEN 1 ELSE 0 END) AS delivered, "
+            "SUM(CASE WHEN name = 'paid' THEN 1 ELSE 0 END) AS paid, "
+            "COUNT(DISTINCT user_id) AS users "
+            "FROM events WHERE ts >= ? GROUP BY day ORDER BY day", (since,))
+        return [dict(r) for r in rows]
+
+    # ------------------------------------------------------- per-user analytics
+    def user_analytics(self, user_id: int, limit: int = 120) -> dict:
+        user = self.user(user_id) or {}
+        out = {
+            "user": user,
+            "counts": {},
+            "stores": [],
+            "videos": [],
+            "events": self.events(limit=limit, user_id=user_id),
+            "searches": [dict(r) for r in self._q(
+                "SELECT ref, COUNT(*) AS c FROM events WHERE user_id = ? AND name = 'search' "
+                "GROUP BY ref ORDER BY c DESC LIMIT 10", (user_id,))],
+        }
+        for row in self._q("SELECT name, COUNT(*) AS c FROM events WHERE user_id = ? GROUP BY name",
+                           (user_id,)):
+            out["counts"][row["name"]] = row["c"]
+        out["stores"] = [dict(r) for r in self._q(
+            "SELECT e.store_id AS id, COALESCE(s.name, '?') AS name, COUNT(*) AS hits, "
+            "COUNT(DISTINCT e.name) AS kinds, MAX(e.ts) AS last_ts "
+            "FROM events e LEFT JOIN stores s ON s.id = e.store_id "
+            "WHERE e.user_id = ? AND e.store_id IS NOT NULL GROUP BY e.store_id ORDER BY hits DESC",
+            (user_id,))]
+        out["videos"] = [dict(r) for r in self._q(
+            "SELECT e.file_id AS id, COALESCE(f.name, 'deleted') AS name, COUNT(*) AS hits, "
+            "MAX(e.ts) AS last_ts FROM events e LEFT JOIN files f ON f.id = e.file_id "
+            "WHERE e.user_id = ? AND e.file_id IS NOT NULL AND e.name IN ('deliver','view_file') "
+            "GROUP BY e.file_id ORDER BY hits DESC LIMIT 40", (user_id,))]
+        orders = self.orders_for(user_id) if hasattr(self, "orders_for") else []
+        out["orders"] = [dict(o) for o in orders]
+        grants = self.grants_for(user_id) if hasattr(self, "grants_for") else []
+        out["grants"] = [dict(g) for g in grants]
+        return out
+
+    # ------------------------------------------------------ per-store analytics
+    def store_analytics(self, store_id: int, limit: int = 300) -> dict:
+        store = self.store(store_id) or {}
+        out = {"store": store, "counts": {}, "files": [], "funnel": {}, "events": []}
+        for row in self._q("SELECT name, COUNT(*) AS c FROM events WHERE store_id = ? GROUP BY name",
+                           (store_id,)):
+            out["counts"][row["name"]] = row["c"]
+        out["files"] = [dict(r) for r in self._q(
+            "SELECT f.id, f.name, f.kind, f.views, "
+            "(SELECT COUNT(DISTINCT e.user_id) FROM events e WHERE e.file_id = f.id AND e.name = 'deliver') AS uniq, "
+            "(SELECT COUNT(*) FROM events e WHERE e.file_id = f.id AND e.name = 'deliver') AS sends, "
+            "(SELECT MAX(e.ts) FROM events e WHERE e.file_id = f.id AND e.name = 'deliver') AS last_ts "
+            "FROM files f WHERE f.store_id = ? ORDER BY f.id DESC", (store_id,))]
+        out["events"] = self.events(limit=limit, store_id=store_id)
+        out["watchers"] = [dict(r) for r in self._q(
+            "SELECT e.user_id, COALESCE(u.name, '?') AS name, u.username AS username, "
+            "COUNT(DISTINCT e.file_id) AS videos, COUNT(*) AS sends, MAX(e.ts) AS last_ts "
+            "FROM events e LEFT JOIN users u ON u.user_id = e.user_id "
+            "WHERE e.store_id = ? AND e.name = 'deliver' AND e.user_id IS NOT NULL "
+            "GROUP BY e.user_id ORDER BY videos DESC, last_ts DESC LIMIT ?", (store_id, limit))]
+        out["funnel"] = self.store_funnel(store_id)
+        return out
+
+    def store_funnel(self, store_id: int) -> dict:
+        """How many came, how many watched, how many paid — the convert funnel."""
+        def count(sql: str) -> int:
+            row = self._one(sql, (store_id,))
+            return int(row[0] or 0) if row else 0
+
+        return {
+            "came": count("SELECT COUNT(DISTINCT user_id) FROM events "
+                          "WHERE store_id = ? AND user_id IS NOT NULL"),
+            "watched": count("SELECT COUNT(DISTINCT user_id) FROM events "
+                             "WHERE store_id = ? AND name = 'deliver' AND user_id IS NOT NULL"),
+            "joined": count("SELECT COUNT(DISTINCT user_id) FROM events WHERE store_id = ? "
+                            "AND name IN ('join_click','join_block') AND user_id IS NOT NULL"),
+            "paid": count("SELECT COUNT(DISTINCT user_id) FROM events "
+                          "WHERE store_id = ? AND name = 'paid' AND user_id IS NOT NULL"),
+        }
+
+    def file_watchers(self, file_id: int, limit: int = 200) -> list[dict]:
+        return [dict(r) for r in self._q(
+            "SELECT e.user_id, COALESCE(u.name, '?') AS name, u.username AS username, "
+            "COUNT(*) AS hits, MAX(e.ts) AS last_ts FROM events e "
+            "LEFT JOIN users u ON u.user_id = e.user_id "
+            "WHERE e.file_id = ? AND e.name = 'deliver' AND e.user_id IS NOT NULL "
+            "GROUP BY e.user_id ORDER BY last_ts DESC LIMIT ?", (file_id, limit))]
+
+    def unique_viewers(self, file_id: int) -> int:
+        row = self._one("SELECT COUNT(DISTINCT user_id) AS c FROM events "
+                        "WHERE file_id = ? AND name = 'deliver' AND user_id IS NOT NULL", (file_id,))
+        return int(row["c"]) if row else 0
+
+    # ------------------------------------------------------ per-store force join
+    def store_forcejoin(self, store_id: int) -> str:
+        row = self._one("SELECT forcejoin FROM stores WHERE id = ?", (store_id,))
+        return (row["forcejoin"] or "") if row else ""
+
+    def set_store_forcejoin(self, store_id: int, value: str) -> None:
+        self._run("UPDATE stores SET forcejoin = ? WHERE id = ?", ((value or "").strip(), store_id))
+
+    # -------------------------------------------------------- join channel list
+    def add_join_channel(self, store_id: int | None, ref: str, title: str = "",
+                         chat_id: int | None = None, kind: str = "",
+                         invite: str = "") -> int:
+        cur = self._run(
+            "INSERT INTO join_channels(store_id, ref, title, chat_id, kind, invite, added_at, last_check, enabled) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, 0, 1)",
+            (store_id, ref, title, chat_id, kind, invite, time.time()))
+        return cur.lastrowid
+
+    def join_channels(self, store_id: int | None = None, enabled_only: bool = False,
+                      global_only: bool = False) -> list[dict]:
+        sql = "SELECT * FROM join_channels WHERE 1=1"
+        params: list[Any] = []
+        if store_id is not None:
+            sql += " AND store_id = ?"; params.append(store_id)
+        if global_only:
+            sql += " AND store_id IS NULL"
+        if enabled_only:
+            sql += " AND enabled = 1"
+        sql += " ORDER BY id"
+        return [dict(r) for r in self._q(sql, params)]
+
+    def join_channel(self, channel_id: int) -> dict | None:
+        row = self._one("SELECT * FROM join_channels WHERE id = ?", (channel_id,))
+        return dict(row) if row else None
+
+    def update_join_channel(self, channel_id: int, **fields: Any) -> None:
+        allowed = {"ref", "title", "chat_id", "kind", "invite", "enabled", "last_check", "error"}
+        sets, params = [], []
+        for key, value in fields.items():
+            if key in allowed:
+                sets.append(f"{key} = ?"); params.append(value)
+        if not sets:
+            return
+        params.append(channel_id)
+        self._run(f"UPDATE join_channels SET {', '.join(sets)} WHERE id = ?", params)
+
+    def delete_join_channel(self, channel_id: int) -> None:
+        self._run("DELETE FROM join_channels WHERE id = ?", (channel_id,))
+
+    def remove_join_channels(self, store_id: int | None) -> None:
+        if store_id is None:
+            self._run("DELETE FROM join_channels WHERE store_id IS NULL")
+        else:
+            self._run("DELETE FROM join_channels WHERE store_id = ?", (store_id,))
+
+    # --------------------------------------------------- join prompts (gate txt)
+    def join_prompt_set(self, user_id: int, file_id: int, token: str = "") -> None:
+        self._run(
+            "INSERT INTO join_prompts(user_id, file_id, token, attempts, created) VALUES(?, ?, ?, 1, ?) "
+            "ON CONFLICT(user_id, file_id) DO UPDATE SET attempts = attempts + 1, token = excluded.token",
+            (user_id, file_id, token, time.time()))
+
+    def join_prompt(self, user_id: int, file_id: int) -> dict | None:
+        row = self._one("SELECT * FROM join_prompts WHERE user_id = ? AND file_id = ?",
+                        (user_id, file_id))
+        return dict(row) if row else None
+
+    def join_prompts(self, limit: int = 200) -> list[dict]:
+        return [dict(r) for r in self._q(
+            "SELECT p.*, COALESCE(f.name, 'deleted') AS file_name, COALESCE(u.name, '?') AS user_name "
+            "FROM join_prompts p LEFT JOIN files f ON f.id = p.file_id "
+            "LEFT JOIN users u ON u.user_id = p.user_id ORDER BY p.created DESC LIMIT ?", (limit,))]
+
+    def clear_join_prompt(self, user_id: int, file_id: int) -> None:
+        self._run("DELETE FROM join_prompts WHERE user_id = ? AND file_id = ?", (user_id, file_id))
+
+    # ---------------------------------------------------------- file helpers v3
+    def set_file_bytes(self, file_id: int, size: int | None) -> None:
+        if size:
+            self._run("UPDATE files SET bytes = ? WHERE id = ?", (int(size), file_id))
+
+    def count_files(self) -> int:
+        return int(self._one("SELECT COUNT(*) AS c FROM files")["c"])
+
+    def count_mirrors(self) -> int:
+        return int(self._one("SELECT COUNT(*) AS c FROM files WHERE mirror_msg IS NOT NULL")["c"])
+
+    def set_mirror(self, file_id: int, chat_id: int, msg_id: int) -> None:
+        """Remember the bot-side copy of a file so **every** later delivery is a
+        plain send — no repeated forward/delete churn (that was the FloodWait)."""
+        self._run("UPDATE files SET mirror_chat = ?, mirror_msg = ?, mirror_ts = ? WHERE id = ?",
+                  (chat_id, msg_id, time.time(), file_id))
+
+    def clear_mirror(self, file_id: int) -> None:
+        self._run("UPDATE files SET mirror_chat = NULL, mirror_msg = NULL WHERE id = ?", (file_id,))
+
+    def mirrored_files(self, limit: int = 500) -> list[dict]:
+        return [dict(r) for r in self._q(
+            "SELECT * FROM files WHERE mirror_msg IS NOT NULL ORDER BY id DESC LIMIT ?", (limit,))]
+
+    def missing_mirrors(self, limit: int = 200) -> list[dict]:
+        return [dict(r) for r in self._q(
+            "SELECT * FROM files WHERE (mirror_msg IS NULL OR mirror_msg = 0) ORDER BY id LIMIT ?",
+            (limit,))]
+
+    def set_file_uid(self, file_id: int, uid: str) -> None:
+        self._run("UPDATE files SET uid = ? WHERE id = ?", (uid, file_id))
+
+    def file_by_uid(self, uid: str) -> dict | None:
+        row = self._one("SELECT * FROM files WHERE uid = ?", (uid,))
+        return dict(row) if row else None
+
+    def file_by_code(self, code: str) -> dict | None:
+        row = self._one("SELECT * FROM files WHERE code = ?", (code,))
+        return dict(row) if row else None
+
+    def backfill_uids(self) -> int:
+        n = 0
+        for row in self._q("SELECT id FROM files WHERE uid IS NULL OR uid = ''"):
+            self.set_file_uid(row["id"], f"{row['id']}{int(time.time()) % 100000:05d}{row['id'] % 97:02d}")
+            n += 1
+        return n
+
+    def set_file_locked(self, file_id: int, locked: int) -> None:
+        self._run("UPDATE files SET locked = ? WHERE id = ?", (1 if locked else 0, file_id))
+
+    def duplicate_files(self) -> list[dict]:
+        return [dict(r) for r in self._q(
+            "SELECT store_id, chat_id, msg_id, COUNT(*) AS c, GROUP_CONCAT(id) AS ids, "
+            "MIN(name) AS name FROM files GROUP BY store_id, chat_id, msg_id HAVING c > 1 "
+            "ORDER BY c DESC")]
+
+    def purge_duplicate_files(self) -> int:
+        removed = 0
+        for row in self.duplicate_files():
+            ids = [int(x) for x in str(row["ids"]).split(",")][1:]
+            for fid in ids:
+                self._run("DELETE FROM link_files WHERE file_id = ?", (fid,))
+                self._run("DELETE FROM files WHERE id = ?", (fid,))
+                removed += 1
+        return removed
+
+    def store_labels(self) -> dict:
+        return {r["id"]: r["name"] for r in self._q("SELECT id, name FROM stores")}
+
+    def attach_meta_chunk(self, rows: list[tuple[str, str]]) -> None:
+        for key, value in rows:
+            self.set_meta(key, value)
+
     # -------------------------------------------------------------- welcome
     def set_welcome(self, admin_id: int, text: str) -> None:
         self._run(
@@ -1161,13 +1563,17 @@ class Database:
 
     def create_campaign(self, admin_id: int, *, title: str = "", text: str = "",
                         files: list[int] | None = None, audience: str = "all",
-                        status: str = "draft",
-                        scheduled_at: float | None = None) -> int:
+                        status: str = "draft", scheduled_at: float | None = None,
+                        buttons: str = "", slug: str = "",
+                        media_caption: str = "above", online_button: int | None = None) -> int:
         cur = self._run(
             "INSERT INTO campaigns(admin_id, title, text, files, audience, status,"
-            " total, scheduled_at, created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            " total, scheduled_at, created_at, buttons, slug, media_caption, online_button)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (admin_id, title or "", text or "", json.dumps(files or []),
-             audience, status, 0, scheduled_at, time.time()),
+             audience, status, 0, scheduled_at, time.time(),
+             buttons or "", slug or "", media_caption or "above",
+             None if online_button is None else (1 if online_button else 0)),
         )
         return int(cur.lastrowid)
 

@@ -195,6 +195,30 @@ async def _notify_admin(admin_id: int, text: str) -> None:
         pass
 
 
+async def mirror_loop() -> None:
+    """Keep the bot-side media cache warm.
+
+    Every file that the bot cannot read directly is copied **once**, in the
+    background. That is what makes a click instant and a broadcast cheap — and
+    it removes the old “forward to the board and delete it again” churn that
+    ended in FloodWait every time a few users clicked the same video.
+    """
+    from app.services.media_cache import warm_mirrors
+    await asyncio.sleep(45)                       # let the bot settle after boot
+    while True:
+        try:
+            if not db.missing_mirrors(1):
+                await asyncio.sleep(900)
+                continue
+            result = await warm_mirrors(limit=8, delay=2.0)
+            if result["mirrored"]:
+                log.info("Media cache: %s file(s) mirrored, %s waiting",
+                         result["mirrored"], result["missing"])
+        except Exception as exc:                  # never let a worker die
+            log.error("mirror loop error: %s", exc)
+        await asyncio.sleep(120)
+
+
 def start_all() -> list[asyncio.Task]:
     from app.runtime import spawn
     tasks = [
@@ -204,6 +228,7 @@ def start_all() -> list[asyncio.Task]:
         spawn(reminder_loop()),
         spawn(session_watchdog()),
         spawn(campaign_loop()),
+        spawn(mirror_loop()),
     ]
     log.info("Started %s background workers", len(tasks))
     return tasks

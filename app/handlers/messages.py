@@ -15,7 +15,7 @@ from app.handlers.state import ask, batch_mode, ctx as flow_ctx_state, flow as r
 from app.logger import log
 from app.runtime import bot, spawn
 from app import i18n
-from app.services import access, broadcast, scanner
+from app.services import access, broadcast, flow, media_guard, scanner
 from app.services.telegram import safe_call
 from app.storage import db
 from app.utils import esc, safe_int
@@ -37,6 +37,9 @@ USER_ACTIONS = {
     "unban_user",          # unban
     "set_welcome",         # welcome message
     "setting_edit",        # ব্যানেল/ওয়েবসাইট থেকে সেটিং বদলানো (অ্যাডমিন)
+    "add_channel",         # চ্যানেল ম্যানেজমেন্ট
+    "store_forcejoin",     # স্টোর-ভিত্তিক ফোর্স জয়েন
+    "link_limit",          # লিমিটেড লিংকের ক্লিক সংখ্যা
 }
 KIND_MAP = (("video", "Video"), ("photo", "Photo"), ("audio", "Audio"),
             ("document", "Document"), ("voice", "Audio"))
@@ -68,6 +71,14 @@ async def media_upload(event) -> None:
     if not event.media:
         return
     admin_id = event.sender_id
+
+    # The strict filter comes FIRST, before every other branch: a text message
+    # with a link preview, a sticker or a random document must never be stored.
+    kind, reason = media_guard.classify(event.message)
+    if kind is None and not _has_admin_flow(admin_id):
+        if access.is_admin(admin_id):
+            await _text_guard_reply(event, reason)
+        return
 
     # Admin is setting a store cover image.
     pending_cover = peek(admin_id)
@@ -135,30 +146,87 @@ async def media_upload(event) -> None:
     store_id = db.active_store_id(admin_id)
     store = db.store(store_id) if store_id else None
     if store is None:
-        await event.respond("⚠️ Set an <b>active store</b> from the panel first (/admin).")
+        await event.respond("⚠️ আগে প্যানেল থেকে একটা <b>অ্যাকটিভ স্টোর</b> বেছে নিন (/admin)।")
         return
 
+    count = db.store_stats(store["id"])["files"]
     file_id = db.add_file(
         store_id=store["id"],
-        name=f"Item_{db.store_stats(store['id'])['files'] + 1}",
-        kind=_kind_of(event.message),
+        name=media_guard.display_name(event.message, kind, count + 1),
+        kind=kind,
         chat_id=event.chat_id,
         msg_id=event.message.id,
         size=getattr(getattr(event.message, "file", None), "size", None),
+        duration=media_guard.duration_of(event.message),
     )
     if file_id is None:
-        await event.respond("ℹ️ This file is already in the store — skipped.")
+        await event.respond("ℹ️ এই ফাইলটি অলরেডি স্টোরে আছে — আবার সেভ করা হয়নি।")
         return
+    db.set_file_uid(file_id, f"{file_id}x{int(time.time()) % 100000:05d}")
+    db.log_event("add_file", admin_id, store["id"], file_id, "upload", kind)
+
+    # Mirror it in the background: doing it now means every later click and every
+    # broadcast is a plain bot send — no forward/delete churn, no FloodWait.
+    spawn(mirror_soon(file_id))
 
     if admin_id in batch_mode:
         batch_mode[admin_id].append(file_id)
-        await event.respond(f"➕ Added to batch — {len(batch_mode[admin_id])} file(s). Send /done when finished.")
+        await event.respond(
+            f"➕ <b>যোগ হয়েছে</b> — এই ব্যাচে {len(batch_mode[admin_id])} টি "
+            f"({kind})। সব পাঠানো শেষ হলে /done দিন।")
         return
 
+    link = f"https://t.me/{runtime.bot_username}?start=f{file_id}" if runtime.bot_username else ""
+    buttons = []
+    if link:
+        buttons.append([Button.url("🔗 লিংক কপি করার জন্য খুলুন", link)])
+    buttons.append([Button.inline("📛 নাম বদলান", f"rf:{file_id}"),
+                    Button.inline("🗂 ফাইল লিস্ট", f"fms:{store['id']}")])
     await event.respond(
-        f"✅ Saved to <b>{esc(store['name'])}</b>\n"
-        f"🔗 <code>https://t.me/{runtime.bot_username}?start=f{file_id}</code>"
+        f"✅ <b>{esc(store['name'])}</b> স্টোরে সেভ হয়েছে — <b>{kind}</b>\n"
+        f"নাম: {esc(media_guard.display_name(event.message, kind, count + 1))}\n"
+        + (f"🔗 <code>{link}</code>\n" if link else "")
+        + "\n<i>এখনই চেক হচ্ছে যে সব ইউজার সরাসরি এই ফাইল পাবে কি না (একবার ক্যাশ হবে)।</i>",
+        buttons=buttons,
     )
+
+
+def _has_admin_flow(admin_id: int) -> bool:
+    pending = peek(admin_id)
+    return bool(pending) and pending.get("action") in ("store_cover", "payment_proof")
+
+
+def _is_add_channel_forward(admin_id: int) -> bool:
+    """A forwarded post while the “add channel” flow is waiting."""
+    pending = peek(admin_id)
+    return bool(pending) and pending.get("action") == "add_channel"
+
+
+_last_text_nudge: dict[int, float] = {}
+
+
+async def _text_guard_reply(event, reason: str) -> None:
+    """Tell the admin — clearly and once — that text is never saved as content."""
+    admin_id = event.sender_id
+    now = time.time()
+    if now - _last_text_nudge.get(admin_id, 0) < 20:
+        return                                    # don't spam on every stray text
+    _last_text_nudge[admin_id] = now
+    await event.respond(media_guard.reject_text(reason))
+
+
+async def mirror_soon(file_id: int) -> None:
+    """Prepare the bot-side copy of a freshly added file (background)."""
+    from app.services.sender import ensure_ready
+    row = db.file(file_id)
+    if row is None:
+        return
+    try:
+        updated = await ensure_ready(row)
+        if updated and updated.get("mirror_msg"):
+            db.log_event("mirror_ok", None, row["store_id"], file_id, "auto")
+    except Exception as exc:
+        log.debug("background mirror failed for %s: %s", file_id, exc)
 
 
 # --------------------------------------------------------------- search input
@@ -186,6 +254,7 @@ async def search_input(event) -> None:
         await event.respond(texts.access_denied(store["name"]))
         return
 
+    db.log_event("search", user_id, store_id, None, text[:80], "store")
     matches = db.search_files(store_id, text.lower(), cfg.SEARCH_RESULT_LIMIT)
     if not matches:
         await event.respond(f"❌ Nothing found for “{esc(text)}” in <b>{esc(store['name'])}</b>.\n"
@@ -297,6 +366,83 @@ async def pending_input(event) -> None:
             await send_panel(event, edit=False)
         except Exception:
             pass
+        return
+
+    # ------------------------------------------------------- channels (v3)
+    if action == "add_channel":
+        from app.services import channels as channels_service
+        target = text.strip()
+        forwarded = getattr(event.message, "forward", None)
+        ref = target
+        if forwarded is not None and not target:
+            try:
+                origin = await event.get_chat()
+                ref = getattr(origin, "username", "") or str(getattr(origin, "id", ""))
+            except Exception:
+                ref = ""
+        result = await channels_service.add_channel(ref)
+        if result.get("ok"):
+            await answer(f"✅ চ্যানেল যোগ হয়েছে: <b>{esc(result.get('title') or ref)}</b>\n"
+                         f"ID: <code>{result.get('chat_id')}</code>")
+            try:
+                from app.handlers.panel_v3 import channels_home
+                await channels_home(event, "")
+            except Exception:
+                pass
+        else:
+            await answer(f"⚠️ চ্যানেল পাওয়া গেল না: {esc(str(result.get('error') or ''))}\n"
+                         "বট যেন চ্যানেলের অ্যাডমিন হয়, অথবা প্রাইভেট হলে ইনভাইট লিংক দিন।")
+        return
+
+    if action == "store_forcejoin":
+        from app.services import forcejoin as forcejoin_service
+        store_id = safe_int(ctx.get("store_id"))
+        raw = text.strip()
+        if raw.lower() in ("off", "none", "-", "no", "disable", "বন্ধ"):
+            db.set_store_forcejoin(store_id, "")
+            forcejoin_service.clear_cache()
+            await answer("✅ এই স্টোরের আলাদা চ্যানেল বন্ধ করা হলো।")
+        else:
+            cleaned = forcejoin_service.normalize(raw)
+            if not cleaned:
+                ask(admin_id, action, **ctx)
+                await answer("⚠️ চ্যানেল চেনা গেল না — <code>@name</code>, "
+                             "<code>https://t.me/+ইনভাইট</code> বা <code>-100…</code> দিন।")
+                return
+            db.set_store_forcejoin(store_id, cleaned)
+            forcejoin_service.clear_cache()
+            store = db.store(store_id) or {}
+            await answer(f"✅ <b>{esc(store.get('name') or '')}</b> — এই স্টোরে এখন "
+                         f"<code>{esc(cleaned)}</code> চ্যানেলেও জয়েন লাগবে।")
+            try:
+                from app.handlers.panel_v3 import store_forcejoin_screen
+                await store_forcejoin_screen(event, str(store_id))
+            except Exception:
+                pass
+        return
+
+    if action == "link_limit":
+        file_id = safe_int(ctx.get("file_id"))
+        limit = safe_int(text, -1)
+        if limit < 0:
+            ask(admin_id, action, **ctx)
+            await answer("⚠️ শুধু সংখ্যা লিখুন (যেমন 100), অথবা <code>0</code> = আনলিমিটেড।")
+            return
+        file_row = db.file(file_id)
+        if file_row is None:
+            await answer("⚠️ ফাইলটি পাওয়া গেল না।")
+            return
+        token = db.create_link(admin_id, [file_id], None, kind="limited",
+                               max_clicks=limit, note="bot")
+        link = (f"https://t.me/{runtime.bot_username}?start=t{token}"
+                if runtime.bot_username else token)
+        label = f"{limit} বার খোলা যাবে" if limit else "আনলিমিটেড"
+        await answer(
+            f"🔗 <b>লিংক তৈরি হয়েছে</b> ({label})\n\n"
+            f"<code>{link}</code>\n\n"
+            f"📄 {esc(file_row['name'])}"
+            + ("\n\n<i>লিমিট শেষ হলে ইউজারকে বলা হবে — অ্যাক্সেস দেওয়া হবে না।</i>"
+               if limit else ""))
         return
 
     # ---------------------------------------------------------------- scans

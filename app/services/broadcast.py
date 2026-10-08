@@ -91,17 +91,31 @@ def resolve_audience(admin_id: int, spec: str) -> list[int]:
             targets = broadcast_targets(admin_id, f"store:{store_id}")
     else:
         targets = broadcast_targets(admin_id, spec)
-    # never broadcast to the admins themselves, never twice
-    return [uid for uid in dict.fromkeys(int(u) for u in targets)
-            if uid not in cfg.ADMIN_IDS]
+    targets = [uid for uid in dict.fromkeys(int(u) for u in targets)
+               if uid not in cfg.ADMIN_IDS]
+    # Optional recency filter — keeps a huge, mostly dead audience from turning a
+    # broadcast into an hour of retries.
+    days = settings.get_int("BROADCAST_REACH_DAYS", 0)
+    if days:
+        cutoff = time.time() - days * 86400
+        recent = {row["user_id"] for row in db.recent_user_ids(cutoff)}
+        targets = [uid for uid in targets if uid in recent] or targets
+    return targets
 
 
 # ------------------------------------------------------------------ campaigns
 def create_campaign(admin_id: int, *, text: str = "", title: str = "",
                     audience: str = "all", files: list[int] | None = None,
                     scheduled_at: float | None = None,
-                    start: bool = True) -> dict:
-    """Build a campaign and (optionally) put it in the queue right away."""
+                    start: bool = True, buttons: str = "",
+                    link_slug: str = "", caption_position: str = "above",
+                    online_button: int | None = None) -> dict:
+    """Build a campaign and (optionally) put it in the queue right away.
+
+    `buttons` is the admin's button text (`label | url` per line) — inline URL
+    buttons are attached to **every** message of the broadcast, which is what the
+    “online button” option means in the panel.
+    """
     files = [int(f) for f in (files or []) if f]
     if scheduled_at and scheduled_at > time.time():
         status = SCHEDULED
@@ -112,6 +126,8 @@ def create_campaign(admin_id: int, *, text: str = "", title: str = "",
     campaign_id = db.create_campaign(
         admin_id, title=title, text=text or "", files=files,
         audience=audience or "all", status=status, scheduled_at=scheduled_at,
+        buttons=buttons or "", slug=link_slug or "", media_caption=caption_position or "above",
+        online_button=online_button,
     )
     targets = resolve_audience(admin_id, audience or "all")
     db.add_campaign_items(campaign_id, targets)
@@ -119,6 +135,43 @@ def create_campaign(admin_id: int, *, text: str = "", title: str = "",
     log.info("Campaign #%s created by admin %s → %s targets (%s)",
              campaign_id, admin_id, len(targets), audience)
     return db.campaign(campaign_id) or {}
+
+
+def online_button_url(campaign: dict) -> str:
+    """The “open the store / open the bot” URL used by the online button."""
+    from app import runtime
+    slug = (campaign.get("slug") or "").strip()
+    files = campaign.get("file_ids") or []
+    store = None
+    if files:
+        row = db.file(files[0])
+        if row:
+            store = db.store(row["store_id"])
+    if not store and slug:
+        store = db.store_by_slug(slug)
+    username = runtime.bot_username or ""
+    if store and username:
+        return f"https://t.me/{username}?start={store['slug']}"
+    if username:
+        return f"https://t.me/{username}"
+    return ""
+
+
+def campaign_buttons(campaign: dict):
+    """All inline buttons of a campaign: the admin's own + the online button."""
+    from app.utils import parse_button_spec
+    rows = parse_button_spec(campaign.get("buttons") or "")
+    flag = campaign.get("online_button")
+    wants_online = settings.get_bool("BROADCAST_SEND_ONLINE_BUTTON", True) \
+        if flag is None else bool(flag)
+    if wants_online:
+        url = online_button_url(campaign)
+        if url:
+            label = (settings.get_str("BROADCAST_ONLINE_LABEL")
+                     or "🟢 অনলাইন — স্টোর খুলুন")
+            if not any(label == existing[0] for row in rows for existing in row):
+                rows.append([(label, url)])
+    return rows
 
 
 def preview(campaign: dict, sample_name: str = "রহিম") -> str:
@@ -142,31 +195,65 @@ class BlockedByUser(Exception):
     """The user blocked the bot / deleted the account — stop retrying them."""
 
 
-async def _send_to_user(campaign: dict, user_id: int) -> None:
-    """Send one campaign message. Raises on failure so the queue can record it."""
+async def _send_to_user(campaign: dict, user_id: int) -> str:
+    """Send one campaign message. Raises on failure so the queue can record it.
+
+    Media campaigns no longer depend on a userbot session: `deliver()` mirrors the
+    file once and then plain-sends it, so a broadcast to thousands of users really
+    reaches them (this used to silently fail for everyone but the admin). The
+    inline buttons — including the “online” one — are attached to the message.
+    """
+    from app.services.sender import deliver_file_id, send_text
+
     file_ids = campaign.get("file_ids") or []
     text = campaign.get("text") or ""
-    if file_ids:
-        from app.services.sender import deliver_file_id
+    user = db.user(user_id) or {}
+    body = personalize(text, user.get("name") or "", user.get("username") or "")
+    buttons = campaign_buttons(campaign) or None
 
-        user = db.user(user_id) or {}
-        body = personalize(text, user.get("name") or "", user.get("username") or "")
+    if file_ids:
+        from app.services.sender import ensure_ready
         max_files = settings.get_int("BROADCAST_MAX_FILES", 5)
-        for index, file_id in enumerate(file_ids[:max_files]):
-            result = await deliver_file_id(user_id, file_id,
-                                           body if index == 0 else (runtime_caption() or ""))
+        chosen = file_ids[:max_files]
+        # Mirror once, up front: if this fails for every file the message would be
+        # an empty send, and the queue would keep retrying a broken campaign.
+        ready = False
+        for file_id in chosen:
+            row = db.file(file_id)
+            if row is None:
+                continue
+            updated = row if row.get("mirror_msg") else await ensure_ready(row)
+            if updated and updated.get("mirror_msg"):
+                ready = True
+                break
+        if not ready:
+            preview_row = db.file(chosen[0])
+            if preview_row is None:
+                raise RuntimeError("ফাইলটি মুছে ফেলা হয়েছে")
+            probe = await deliver_file_id(user_id, chosen[0], body, buttons=buttons)
+            if not probe.ok:
+                raise RuntimeError(f"media unavailable ({probe.reason}): {probe.detail}")
+
+        sent = 0
+        for index, file_id in enumerate(chosen):
+            caption = body if index == 0 else (runtime_caption() or "")
+            result = await deliver_file_id(user_id, file_id, caption, buttons=buttons)
             if not result.ok:
+                if sent:
+                    break                     # partial send: don't mark as failed
                 raise RuntimeError(f"file {file_id}: {result.reason}")
-            if index + 1 < min(len(file_ids), max_files):
+            sent += 1
+            if index + 1 < len(chosen):
                 await asyncio.sleep(settings.get_float("BROADCAST_MEDIA_DELAY", 1.0))
-        return
+        return "sent"
 
     if not text:
         raise RuntimeError("empty message")
-    user = db.user(user_id) or {}
-    body = personalize(text, user.get("name") or "", user.get("username") or "")
-    await safe_call(bot.send_message, user_id, body, link_preview=False,
-                    what="broadcast", retries=2)
+    message = await safe_call(bot.send_message, user_id, body, link_preview=False,
+                              buttons=buttons, what="broadcast", retries=2)
+    if message is None:
+        raise RuntimeError("send returned nothing")
+    return "sent"
 
 
 def runtime_caption() -> str:
@@ -263,6 +350,9 @@ async def run_campaign(campaign_id: int, progress: ProgressCb | None = None,
                 db.mark_campaign_item(campaign_id, user_id, kind, str(exc))
                 log.debug("campaign #%s → %s %s", campaign_id, user_id, kind)
 
+        if index == 1:
+            db.log_event("broadcast_start", None, None, None, str(campaign_id),
+                         f"{len(pending)} targets")
         if progress and (index % 10 == 0 or index == len(pending)):
             fresh = db.campaign_counts(campaign_id)
             await progress(fresh["done"], fresh["total"], fresh["failed"])
@@ -271,7 +361,7 @@ async def run_campaign(campaign_id: int, progress: ProgressCb | None = None,
 
     live = db.campaign_counts(campaign_id)
     cancelled = is_cancelled(campaign_id)
-    status = CANCELLED if cancelled else (DONE if live["pending"] == 0 else DONE)
+    status = CANCELLED if cancelled else (DONE if live["pending"] == 0 else FAILED)
     duration = time.time() - started
     db.update_campaign(campaign_id, status=status, finished_at=time.time())
     _cancel.discard(campaign_id)
@@ -317,20 +407,60 @@ async def notify_owner(campaign: dict, result: dict) -> None:
 
 
 async def test_send(campaign_id: int, admin_ids: list[int]) -> dict:
-    """Send the campaign message to the admins only (nobody else)."""
+    """Send the campaign message to the admins only (nobody else).
+
+    Whatever error the *real* audience would hit shows up here, so a broken
+    campaign is caught before it is fired at thousands of users.
+    """
     campaign = db.campaign(campaign_id)
     if campaign is None:
         return {"ok": False, "error": "not found"}
     sent = failed = 0
+    errors: list[str] = []
     for admin_id in admin_ids:
         try:
             await _send_to_user(campaign, admin_id)
             sent += 1
         except Exception as exc:
             failed += 1
+            errors.append(f"{admin_id}: {exc}"[:200])
             log.warning("test send of campaign #%s to %s failed: %s",
                         campaign_id, admin_id, exc)
-    return {"ok": sent > 0, "sent": sent, "failed": failed}
+    return {"ok": sent > 0, "sent": sent, "failed": failed, "errors": errors}
+
+
+async def test_send_text(text: str, buttons: str = "", user_id: int | None = None,
+                         file_ids: list[int] | None = None) -> bool:
+    """Send one message (with the same button syntax) to a single user.
+
+    The panel uses this for “🧪 my own DM first”, for answering a user from the
+    dashboard and for the channel-composer preview. Returns True when Telegram
+    accepted the message.
+    """
+    from app import config as cfg
+    from app.services.sender import deliver_file_id, send_text
+    from app.utils import parse_button_spec
+
+    targets = [user_id] if user_id else list(cfg.ADMIN_IDS)[:1]
+    if not targets:
+        log.warning("test_send_text: no admin/user id to send to")
+        return False
+    rows = parse_button_spec(buttons) or None
+    ok = False
+    for target in targets:
+        try:
+            if file_ids:
+                for index, fid in enumerate(file_ids):
+                    result = await deliver_file_id(target, int(fid),
+                                                   text if index == 0 else None,
+                                                   buttons=rows)
+                    ok = ok or result.ok
+            else:
+                message = await send_text(target, text, buttons=rows)
+                ok = ok or message is not None
+        except Exception as exc:
+            log.warning("test_send_text to %s failed: %s", target, exc)
+    return ok
 
 
 def resume_unfinished() -> int:

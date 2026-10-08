@@ -275,3 +275,139 @@ def test_public_site_uses_saved_title(client):
     from app.services import settings
     settings.set("SITE_TAGLINE", "এখানেই সব ভিডিও")
     assert "এখানেই সব ভিডিও" in client.get("/").text
+
+
+# ===================================================== v3 panel pages (analytics)
+def test_admin_nav_exposes_the_new_sections(client):
+    page = client.get("/admin", headers=_auth())
+    assert page.status_code == 200
+    for label in ("📡 Channels", "📊 Analytics", "🔗 Links"):
+        assert label in page.text
+
+
+def test_channels_page_lists_and_adds(client):
+    from app.services import channels
+    db.add_join_channel(None, "@my_channel", title="My channel")
+    page = client.get("/admin/channels", headers=_auth())
+    assert page.status_code == 200
+    assert "My channel" in page.text
+
+    from app.services import forcejoin
+    async def fake_resolve(ref, refresh=False, use_cache=True):
+        return {"ok": True, "chat_id": -1001234, "title": "New channel",
+                "kind": "username", "ref": ref, "error": "", "via": "bot"}
+    original = forcejoin.resolve
+    forcejoin.resolve = fake_resolve
+    try:
+        response = client.post("/admin/channels/add", headers=_auth(),
+                               data={"ref": "@new_channel", "store_id": ""},
+                               follow_redirects=False)
+    finally:
+        forcejoin.resolve = original
+    assert response.status_code == 303
+    assert any(row["ref"] == "@new_channel" for row in db.join_channels())
+
+
+def test_composer_page_and_post(client, monkeypatch):
+    from app.services import channels
+    store = _store("Composer store")
+    db.add_join_channel(None, "@post_here", title="Post here", chat_id=-100999)
+    page = client.get(f"/admin/channels/compose?store={store['id']}", headers=_auth())
+    assert page.status_code == 200
+    assert "ইনলাইন বাটন" in page.text
+
+    async def fake_publish(target, **kwargs):
+        return {"ok": True, "message_id": 55, "sent": 1, "failed": 0, "error": ""}
+    monkeypatch.setattr(channels, "publish", fake_publish)
+    response = client.post("/admin/channels/compose", headers=_auth(),
+                           data={"target": "-100999", "text": "Hello", "buttons": "",
+                                 "store_id": str(store["id"]), "link_limit": "-1"},
+                           follow_redirects=False)
+    assert response.status_code == 200
+    assert "পাঠানো হয়েছে" in response.text
+
+
+def test_analytics_page_shows_funnel_and_top_files(client):
+    store = _store("Analytics store")
+    file_id = db.files_of(store["id"])[0]["id"]
+    db.touch_user(USER_ID, "Buyer", "buyer")
+    db.log_event("deliver", USER_ID, store["id"], file_id, "button")
+    db.log_event("paid", USER_ID, store["id"], None, "plan:1")
+    page = client.get("/admin/analytics", headers=_auth())
+    assert page.status_code == 200
+    assert "অ্যানালিটিক্স" in page.text
+    assert "Analytics store" in page.text
+    assert "ফানেল" in page.text
+
+
+def test_store_analytics_page_lists_watchers(client):
+    store = _store("Watch store")
+    file_id = db.files_of(store["id"])[0]["id"]
+    db.touch_user(USER_ID, "Watcher", "watcher")
+    db.log_event("deliver", USER_ID, store["id"], file_id, "button")
+    page = client.get(f"/admin/analytics/store/{store['id']}", headers=_auth())
+    assert page.status_code == 200
+    assert "Watcher" in page.text
+    assert "Interstellar" in page.text
+
+
+def test_file_watchers_page(client):
+    store = _store("File store")
+    file_id = db.files_of(store["id"])[0]["id"]
+    db.touch_user(USER_ID, "Watcher", "watcher")
+    db.log_event("deliver", USER_ID, store["id"], file_id, "button")
+    page = client.get(f"/admin/analytics/file/{file_id}", headers=_auth())
+    assert page.status_code == 200
+    assert "Watcher" in page.text
+
+
+def test_user_detail_page_shows_clicks_and_state(client):
+    store = _store("User store")
+    file_id = db.files_of(store["id"])[0]["id"]
+    db.touch_user(USER_ID, "Detail user", "detail")
+    db.log_event("start", USER_ID, None, None, "start")
+    db.log_event("open_store", USER_ID, store["id"], None, "x")
+    db.log_event("deliver", USER_ID, store["id"], file_id, "button")
+    page = client.get(f"/admin/users/{USER_ID}", headers=_auth())
+    assert page.status_code == 200
+    assert "Detail user" in page.text
+    assert "ভিডিও দেখেছে" in page.text
+    assert "User store" in page.text
+
+
+def test_limited_link_created_from_the_site(client):
+    store = _store("Link store")
+    file_id = db.files_of(store["id"])[0]["id"]
+    response = client.post("/admin/links/new", headers=_auth(),
+                           data={"file_ids": [str(file_id)], "store_id": "",
+                                 "max_clicks": "100", "note": "customer A"},
+                           follow_redirects=False)
+    assert response.status_code == 303
+    links = db.links(limit=5)
+    assert links and links[0]["max_clicks"] == 100
+    assert db.link_file_ids(links[0]["token"]) == [file_id]
+
+    page = client.get("/admin/links", headers=_auth())
+    assert page.status_code == 200
+    assert "customer A" in page.text
+
+
+def test_store_page_has_its_own_force_channel_editor(client):
+    store = _store("Channelled store")
+    page = client.get(f"/admin/stores/{store['id']}", headers=_auth())
+    assert page.status_code == 200
+    assert "আলাদা চ্যানেল" in page.text
+
+
+def test_store_force_channel_saved_from_the_site(client, monkeypatch):
+    from app.services import channels, forcejoin
+    store = _store("Scoped store")
+
+    async def fake_add(ref, store_id=None, title=""):
+        return {"ok": True, "id": 1, "chat_id": -100555, "title": "Store channel"}
+    monkeypatch.setattr(channels, "add_channel", fake_add)
+    response = client.post(f"/admin/stores/{store['id']}/forcejoin", headers=_auth(),
+                           data={"ref": "@store_channel"}, follow_redirects=False)
+    assert response.status_code == 303
+    assert db.store_forcejoin(store["id"]) == "@store_channel"
+    assert "@store_channel" in {t["ref"] for t in forcejoin.targets(store["id"])}

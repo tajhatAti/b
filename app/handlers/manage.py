@@ -501,6 +501,7 @@ async def store_settings(event, rest: str) -> None:
         f"📝 {esc((store.get('description') or '(no description)')[:200])}",
         f"🖼 Cover: {'✅ set' if store.get('cover') else '❌ not set'}",
         f"🔗 Slug: <code>{esc(store['slug'])}</code>",
+        f"📢 আলাদা চ্যানেল: {esc(store.get('forcejoin') or '— (ডিফল্ট চ্যানেল প্রযোজ্য)')}",
     ]
     buttons = [
         [Button.inline("✏️ Rename", f"ssn:{store['id']}"),
@@ -513,6 +514,8 @@ async def store_settings(event, rest: str) -> None:
          Button.inline("👥 Access", f"sga:{store['id']}")],
         [Button.inline("📅 Drip", f"dr:{store['id']}"),
          Button.inline("🔗 Share", f"shr:{store['id']}")],
+        [Button.inline("📢 আলাদা চ্যানেল", f"sfj:{store['id']}"),
+         Button.inline("📊 এই স্টোরের স্ট্যাটস", f"an:store:{store['id']}")],
         [Button.inline("👁 Preview as user", f"s:{store['id']}")],
         [Button.inline("🔙 Back to stores", "adm:stores"),
          Button.inline("🏠 Main panel", "adm:back")],

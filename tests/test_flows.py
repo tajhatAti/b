@@ -89,6 +89,7 @@ def delivered_files(monkeypatch):
         return Delivery(True)
 
     monkeypatch.setattr("app.ui.deliver", fake_deliver)
+    monkeypatch.setattr("app.services.flow.deliver", fake_deliver)
     return calls
 
 
@@ -196,7 +197,7 @@ async def test_clicking_a_file_delivers_it(delivered_files):
     await dispatch(event)
 
     assert delivered_files == [(USER_ID, file_ids[0])]
-    assert event.answers[0][0] == "✅ Sent!"
+    assert "পাঠানো হয়েছে" in event.answers[0][0]
 
 
 @pytest.mark.asyncio

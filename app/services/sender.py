@@ -34,7 +34,7 @@ class Delivery:
     detail: str = ""
 
 
-async def _send_media(chat_id: int, media, caption_text: str) -> None:
+async def _send_media(chat_id: int, media, caption_text: str, buttons=None) -> None:
     """Send media with forward-protection.
 
     Note: `send_file(..., noforwards=True)` is silently ignored by Telethon (it
@@ -49,6 +49,18 @@ async def _send_media(chat_id: int, media, caption_text: str) -> None:
         peer = await safe_call(bot.get_input_entity, chat_id, what="get_input_entity", retries=1)
         input_media = utils.get_input_media(media)
         text, entities = html.parse(caption_text or "")
+        if buttons:
+            from app.utils import button_rows
+            reply_markup = button_rows(buttons)
+            if reply_markup is not None:
+                await safe_call(
+                    bot, functions.messages.SendMediaRequest(
+                        peer=peer, media=input_media, message=text,
+                        entities=entities, noforwards=True, reply_markup=reply_markup,
+                    ),
+                    what="send_media(noforwards+buttons)",
+                )
+                return
         await safe_call(
             bot, functions.messages.SendMediaRequest(
                 peer=peer, media=input_media, message=text,
@@ -62,25 +74,56 @@ async def _send_media(chat_id: int, media, caption_text: str) -> None:
 
     await safe_call(
         bot.send_file, chat_id, media,
-        caption=caption_text or None, what="send_file",
+        caption=caption_text or None, buttons=buttons or None, what="send_file",
     )
 
 
-async def _try_direct(file_row: dict, chat_id: int, caption_text: str) -> bool:
-    try:
-        msg = await safe_call(bot.get_messages, file_row["chat_id"],
-                              ids=file_row["msg_id"], what="get_messages", retries=1)
-    except Exception as exc:
-        log.debug("direct fetch failed for file %s: %s", file_row["id"], exc)
-        return False
-    if not msg or not getattr(msg, "media", None):
-        return False
-    await _send_media(chat_id, msg.media, caption_text)
-    db.bump_views(file_row["id"])
-    return True
+async def _try_direct(file_row: dict, chat_id: int, caption_text: str, buttons=None) -> bool:
+    """Bot-side send. Tries the mirror (best) and then the original location.
+
+    Reading the mirror first is what makes a broadcast to thousands of users
+    cheap: one message, thousands of plain sends, zero userbot traffic.
+    """
+    from app.services.media_cache import mirror_targets
+
+    for source_chat, source_msg in mirror_targets(file_row):
+        if not source_msg:
+            continue
+        try:
+            msg = await safe_call(bot.get_messages, source_chat, ids=source_msg,
+                                  what="get_messages", retries=1)
+        except Exception as exc:
+            log.debug("direct fetch failed for file %s at %s/%s: %s",
+                      file_row["id"], source_chat, source_msg, exc)
+            continue
+        if not msg or not getattr(msg, "media", None):
+            if file_row.get("mirror_msg") and int(source_chat) == int(file_row.get("mirror_chat") or 0):
+                db.clear_mirror(file_row["id"])       # mirror is gone — re-create later
+            continue
+        try:
+            await _send_media(chat_id, msg.media, caption_text, buttons)
+        except FloodWaitError:
+            raise
+        except Exception as exc:
+            log.debug("send of %s to %s failed: %s", file_row["id"], chat_id, exc)
+            continue
+        db.bump_views(file_row["id"])
+        return True
+    return False
 
 
-async def _try_jit(file_row: dict, chat_id: int, caption_text: str) -> Delivery:
+async def ensure_ready(file_row: dict) -> dict:
+    """Make the file sendable (creates the one-time mirror if needed)."""
+    from app.services.media_cache import ensure_mirror
+    if not file_row:
+        return file_row
+    if file_row.get("mirror_msg"):
+        return file_row
+    store = db.store(file_row["store_id"])
+    return await ensure_mirror(file_row, store)
+
+
+async def _try_jit(file_row: dict, chat_id: int, caption_text: str, buttons=None) -> Delivery:
     store = db.store(file_row["store_id"])
     if not store:
         return Delivery(False, NOT_FOUND, "store removed")
@@ -117,21 +160,25 @@ async def _try_jit(file_row: dict, chat_id: int, caption_text: str) -> Delivery:
                 return Delivery(False, ERROR, "forwarded copy never arrived")
 
             try:
-                await _send_media(chat_id, incoming.media, caption_text)
+                await _send_media(chat_id, incoming.media, caption_text, buttons)
+                # Remember this copy: from now on the bot can serve the file
+                # itself and the userbot never has to forward it again.
+                try:
+                    if not file_row.get("mirror_msg"):
+                        db.set_mirror(file_row["id"], event_chat_id(incoming), incoming.id)
+                except Exception as exc:
+                    log.debug("could not remember the mirrored copy: %s", exc)
             finally:
-                if cfg.CLEANUP_JIT_COPY:
+                # Only the *extra* outgoing forward (same chat, second copy) is
+                # deleted. The first copy stays as the cache — deleting it was
+                # what made the bot forward the same video again and again.
+                if cfg.CLEANUP_JIT_COPY and forwarded is not None \
+                        and getattr(forwarded, "id", None) != getattr(incoming, "id", None):
                     try:
-                        await safe_call(incoming.delete, what="delete_copy",
+                        await safe_call(forwarded.delete, what="delete_copy",
                                         raise_after_retries=False)
-                    except Exception as exc:
-                        log.debug("could not delete temporary copy: %s", exc)
-                    # the outgoing forward from `forwarded` is the same chat copy
-                    if forwarded is not None and getattr(forwarded, "id", None) != incoming.id:
-                        try:
-                            await safe_call(forwarded.delete, what="delete_copy",
-                                            raise_after_retries=False)
-                        except Exception:
-                            pass
+                    except Exception:
+                        pass
             db.bump_views(file_row["id"])
             return Delivery(True)
     except FloodWaitError:
@@ -141,8 +188,62 @@ async def _try_jit(file_row: dict, chat_id: int, caption_text: str) -> Delivery:
         return Delivery(False, ERROR, str(exc)[:200])
 
 
-async def deliver(chat_id: int, file_row: dict, caption_text: str | None = None) -> Delivery:
-    """Send one stored file to `chat_id`."""
+async def send_text(chat_id: int, text: str, buttons=None, link_preview: bool = False):
+    """Send a plain message as the bot. Never raises — a broken request must not
+    take down the flow that was only trying to explain something."""
+    if not text:
+        return None
+    try:
+        kwargs = {"link_preview": link_preview}
+        if buttons is not None:
+            kwargs["buttons"] = buttons
+        return await safe_call(bot.send_message, chat_id, text, what="send_text", retries=2,
+                               **kwargs)
+    except Exception as first:
+        log.debug("send_text with buttons failed (%s) — retrying without buttons", first)
+        try:
+            return await safe_call(bot.send_message, chat_id, text, what="send_text",
+                                   retries=1, link_preview=False)
+        except Exception as exc:
+            log.warning("send_text failed for %s: %s", chat_id, exc)
+            return None
+
+
+async def edit_text(message, text: str, buttons=None):
+    """Edit a message we own; falls back to sending a fresh one."""
+    try:
+        return await safe_call(message.edit, text, buttons=buttons, link_preview=False,
+                               what="edit_text", retries=1, raise_after_retries=False)
+    except Exception as exc:
+        log.debug("edit_text failed (%s) — sending instead", exc)
+        try:
+            return await send_text(message.chat_id, text, buttons=buttons)
+        except Exception:
+            return None
+
+
+def event_chat_id(message) -> int:
+    """The chat a message really lives in (works for forwarded copies too)."""
+    for attr in ("chat_id", "peer_id"):
+        value = getattr(message, attr, None)
+        if isinstance(value, int):
+            return value
+        if value is not None:
+            for sub in ("user_id", "chat_id", "channel_id"):
+                inner = getattr(value, sub, None)
+                if inner:
+                    return int(inner) if sub != "user_id" else int(inner)
+    return 0
+
+
+async def deliver(chat_id: int, file_row: dict, caption_text: str | None = None,
+                  buttons=None) -> Delivery:
+    """Send one stored file to `chat_id`.
+
+    Order: bot-side (mirror first) → create the mirror once → live forward as the
+    very last resort. `buttons` lets callers attach inline URL buttons (the
+    “online button” used by broadcasts and channel posts).
+    """
     if not file_row:
         return Delivery(False, NOT_FOUND)
     if caption_text is None:
@@ -150,39 +251,56 @@ async def deliver(chat_id: int, file_row: dict, caption_text: str | None = None)
     caption = caption_text or ""
 
     try:
-        if await _try_direct(file_row, chat_id, caption):
+        if await _try_direct(file_row, chat_id, caption, buttons):
             return Delivery(True)
     except FloodWaitError:
         return Delivery(False, FLOOD)
     except Exception as exc:
         log.debug("direct send failed for file %s: %s", file_row["id"], exc)
 
-    result = await _try_jit(file_row, chat_id, caption)
+    # Not readable yet — create the mirror once, then send from it.
+    try:
+        updated = await ensure_ready(file_row)
+        if updated.get("mirror_msg") and await _try_direct(updated, chat_id, caption, buttons):
+            return Delivery(True)
+    except FloodWaitError:
+        return Delivery(False, FLOOD)
+    except Exception as exc:
+        log.debug("mirror path failed for file %s: %s", file_row["id"], exc)
+
+    result = await _try_jit(file_row, chat_id, caption, buttons)
     if result.ok or result.reason in (NOT_FOUND, NO_SESSION, FLOOD):
         return result
     # Retry the direct path once more: the userbot may have just pulled the file
     # into the bot's reach (e.g. right after the session reconnected).
     try:
-        if await _try_direct(file_row, chat_id, caption):
+        if await _try_direct(file_row, chat_id, caption, buttons):
             return Delivery(True)
     except Exception:
         pass
     return result
 
 
-async def deliver_file_id(chat_id: int, file_id: int, caption_text: str | None = None) -> Delivery:
+async def deliver_file_id(chat_id: int, file_id: int, caption_text: str | None = None,
+                          buttons=None) -> Delivery:
     row = db.file(file_id)
     if not row:
         return Delivery(False, NOT_FOUND)
-    return await deliver(chat_id, row, caption_text)
+    return await deliver(chat_id, row, caption_text, buttons=buttons)
 
 
 async def deliver_many(chat_id: int, file_rows: list[dict],
-                       caption_text: str | None = None, delay: float | None = None) -> int:
+                       caption_text: str | None = None, delay: float | None = None,
+                       buttons=None) -> int:
     sent = 0
     for row in file_rows:
-        result = await deliver(chat_id, row, caption_text)
+        result = await deliver(chat_id, row, caption_text, buttons=buttons)
         if result.ok:
             sent += 1
         await asyncio.sleep(delay if delay is not None else 0.4)
     return sent
+
+
+def mirror_ready() -> dict:
+    from app.services.media_cache import stats
+    return stats()

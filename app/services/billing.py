@@ -71,6 +71,7 @@ def create_order_from_plan(user_id: int, store_id: int, plan: dict, method: str,
         amount=amount, currency=settings.get_str("CURRENCY", "৳"), note=note,
     )
 
+    note_order_started(user_id, store_id, int(plan.get("id") or 0), amount)
     if amount <= 0 and settings.get_bool("AUTO_APPROVE_ZERO", True):
         approve_order(order_id, admin_id=0, note="auto (free plan)")
         log.info("Order %s auto-approved (free plan) for user %s", order_id, user_id)
@@ -94,8 +95,16 @@ def approve_order(order_id: int, admin_id: int, note: str = "") -> dict | None:
     db.decide_order(order_id, "approved", admin_id, note)
     if order["note"] and order["note"].startswith("coupon:"):
         db.use_coupon(order["note"].split(":", 1)[1])
+    db.log_event("paid", order["user_id"], order["store_id"], None,
+                 f"order:{order_id}", f"days={days}")
     log.info("Order %s approved by %s", order_id, admin_id)
     return db.order(order_id)
+
+
+def note_order_started(user_id: int, store_id: int, plan_id: int, amount: float) -> None:
+    """Analytics: the user reached the payment step (funnel “came → paid”)."""
+    db.log_event("pay_start", user_id, store_id, None, f"plan:{plan_id}",
+                 f"amount={amount:.0f}")
 
 
 def reject_order(order_id: int, admin_id: int, note: str = "") -> dict | None:

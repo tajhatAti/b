@@ -34,6 +34,11 @@ def admin_panel(admin_id: int, active_store_name: str | None, session_ok: bool,
         Button.inline("🛠 Settings", "adm:settings"),
     ])
     rows.append([
+        Button.inline("📡 Channels", "ch:home"),
+        Button.inline("📊 Analytics", "an:home"),
+        Button.inline("🔗 Links", "lk:home"),
+    ])
+    rows.append([
         Button.inline(f"📩 Support ({open_tickets})" if open_tickets else "📩 Support", "supq"),
         Button.inline("📊 Stats", "adm:stats"),
     ])

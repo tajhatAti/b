@@ -243,6 +243,189 @@ async def is_member(user_id: int) -> bool | None:
         return None
 
 
+# ======================================================= v3: many channels @ once
+# Besides the single default channel (settings → FORCE_CHANNEL) an admin can now
+# keep a *list* of channels — globally and per store. Store 1 may need a different
+# gate than store 2, which is exactly what “store-specific force channel” means.
+def global_targets() -> list[dict]:
+    """Default channel from the panel + every globally registered one."""
+    out: list[dict] = []
+    default = switch()                       # "" when the feature is switched off
+    if default:
+        out.append({"id": 0, "store_id": None, "ref": default,
+                    "title": db.get_meta(META_TITLE, "") or default,
+                    "chat_id": _cached_int(), "invite": join_url(default),
+                    "kind": parse(default)["kind"]})
+    seen = {t["ref"] for t in out}
+    for ref in extra_refs():
+        if ref in seen:
+            continue
+        seen.add(ref)
+        out.append({"id": 0, "store_id": None, "ref": ref, "title": ref,
+                    "chat_id": None, "invite": join_url(ref), "kind": parse(ref)["kind"]})
+    for row in db.join_channels(None, enabled_only=True, global_only=True):
+        ref = normalize(row.get("ref") or "")
+        if not ref or ref in seen:
+            continue
+        seen.add(ref)
+        out.append({"id": row["id"], "store_id": None, "ref": ref,
+                    "title": row.get("title") or ref,
+                    "chat_id": row.get("chat_id"), "invite": row.get("invite") or "",
+                    "kind": row.get("kind") or parse(ref)["kind"]})
+    return out
+
+
+def extra_refs() -> list[str]:
+    """Every extra channel typed into the panel (`FORCE_JOIN_EXTRA`)."""
+    raw = settings.get_str("FORCE_JOIN_EXTRA") or ""
+    parts = [p.strip() for chunk in raw.replace(",", "\n").splitlines() for p in [chunk]]
+    out: list[str] = []
+    for part in parts:
+        ref = normalize(part)
+        if ref and ref not in out:
+            out.append(ref)
+    return out
+
+
+def store_targets(store_id: int | None) -> list[dict]:
+    """Extra channels that only a specific store needs."""
+    if not store_id:
+        return []
+    out: list[dict] = []
+    seen: set[str] = set()
+    raw = db.store_forcejoin(int(store_id))
+    ref = normalize(raw)
+    if ref and settings.get_bool("FORCE_JOIN_ENABLED", True):
+        seen.add(ref)
+        out.append({"id": 0, "store_id": int(store_id), "ref": ref, "title": ref,
+                    "chat_id": None, "invite": join_url(ref) or "",
+                    "kind": parse(ref)["kind"]})
+    for row in db.join_channels(int(store_id), enabled_only=True):
+        ref = normalize(row.get("ref") or "")
+        if not ref or ref in seen:
+            continue
+        seen.add(ref)
+        out.append({"id": row["id"], "store_id": int(store_id), "ref": ref,
+                    "title": row.get("title") or ref, "chat_id": row.get("chat_id"),
+                    "invite": row.get("invite") or "", "kind": row.get("kind") or parse(ref)["kind"]})
+    return out
+
+
+def targets(store_id: int | None = None) -> list[dict]:
+    return global_targets() + store_targets(store_id)
+
+
+def _cached_int() -> int | None:
+    cached = _cached()
+    try:
+        return int(cached) if cached else None
+    except ValueError:
+        return None
+
+
+async def ensure_target(target: dict, refresh: bool = False) -> dict:
+    """Resolve one configured channel to a chat id (cached in `meta`/the row)."""
+    ref = target.get("ref") or ""
+    if not ref:
+        return {**target, "ok": False, "error": "empty"}
+    if target.get("chat_id") and not refresh:
+        return {**target, "ok": True, "error": ""}
+    result = await resolve(ref, refresh=refresh, use_cache=not refresh)
+    if result.get("ok"):
+        if target.get("id"):
+            db.update_join_channel(target["id"], chat_id=result["chat_id"],
+                                   title=result.get("title") or target.get("title") or "",
+                                   kind=result.get("kind") or target.get("kind") or "",
+                                   last_check=time.time(), error="")
+        return {**target, "chat_id": result["chat_id"],
+                "title": result.get("title") or target.get("title") or ref,
+                "ok": True, "error": ""}
+    if target.get("id"):
+        db.update_join_channel(target["id"], last_check=time.time(),
+                               error=str(result.get("error") or "")[:180])
+    return {**target, "ok": False, "error": result.get("error") or "not resolved"}
+
+
+async def check_many(user_id: int, store_id: int | None = None) -> dict:
+    """Which of the channels for this store is the user still missing?
+
+    Returns {ok, missing: [...], skipped: int, checked: int}. Anything we cannot
+    verify is skipped, so a Telegram hiccup never blocks a paying customer.
+    """
+    groups = targets(store_id)
+    if not groups:
+        return {"ok": True, "missing": [], "skipped": 0, "checked": 0}
+    client = runtime.get_client()
+    if client is None:
+        return {"ok": True, "missing": [], "skipped": len(groups), "checked": 0}
+    missing, skipped, checked = [], 0, 0
+    for target in groups:
+        info = await ensure_target(target)
+        if not info.get("ok"):
+            skipped += 1
+            continue
+        answer = await _member_of(client, info.get("chat_id"), user_id)
+        if answer is None:
+            skipped += 1
+            continue
+        checked += 1
+        if answer is False:
+            missing.append(info)
+    return {"ok": not missing, "missing": missing, "skipped": skipped, "checked": checked}
+
+
+async def _member_of(client, chat_id, user_id: int) -> bool | None:
+    from telethon.errors import UserNotParticipantError
+    from telethon.tl.functions.channels import GetParticipantRequest
+    if not chat_id:
+        return None
+    try:
+        await safe_call(client(GetParticipantRequest(channel=chat_id, user_id=user_id)),
+                        what="force_join", retries=1, raise_after_retries=False)
+        return True
+    except UserNotParticipantError:
+        return False
+    except Exception as exc:
+        text = str(exc).lower()
+        if "not a participant" in text or ("participant" in text and "not" in text):
+            return False
+        log.debug("force-join check skipped for %s: %s", chat_id, exc)
+        return None
+
+
+def invite_of(target: dict) -> str:
+    """The link the user should click for one channel."""
+    if target.get("invite"):
+        return target["invite"]
+    return join_url(target.get("ref") or "")
+
+
+def gate_keyboard(user_id: int, file_id: int, missing: list[dict], token: str = ""):
+    """Inline keyboard for the gate: one join button per channel + a re-check."""
+    from telethon import Button
+    rows = []
+    for target in missing[:4]:
+        url = invite_of(target)
+        label = f"📢 {target.get('title') or target.get('ref')}"
+        if url:
+            rows.append([Button.url(label[:60], url)])
+    payload = f"fj:{user_id}:{file_id}" + (f":{token}" if token else "")
+    rows.append([Button.inline("✅ আমি জয়েন করেছি", payload.encode())])
+    return rows
+
+
+def gate_text(missing: list[dict], variant: str = "fresh") -> str:
+    channels = "\n".join(f"  • {t.get('title') or t.get('ref')}" for t in missing[:6])
+    extra = note()
+    tail = f"\n\n{extra}" if extra else ""
+    if variant == "again":
+        return ("⛔️ এখনো জয়েন করেননি!\n\n"
+                f"নিচের চ্যানেল{'গুলো' if len(missing) > 1 else ''} জয়েন করে আবার "
+                "“আমি জয়েন করেছি” চাপুন:\n" + channels + tail)
+    return ("🔐 <b>ফাইলটি পেতে আগে চ্যানেল জয়েন করুন</b>\n\n"
+            "একবার জয়েন করলেই সব ভিডিও/ফাইল পাবেন:\n" + channels + tail)
+
+
 def clear_cache() -> None:
     _cache.clear()
     for key in ("force_join_cache",):

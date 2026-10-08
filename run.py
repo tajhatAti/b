@@ -30,7 +30,7 @@ from app.storage import db
 
 HANDLER_MODULES = ("app.handlers.admin", "app.handlers.billing",
                    "app.handlers.extras", "app.handlers.inline",
-                   "app.handlers.manage", "app.handlers.messages",
+                   "app.handlers.manage", "app.handlers.messages", "app.handlers.panel_v3",
                    "app.handlers.user")
 
 

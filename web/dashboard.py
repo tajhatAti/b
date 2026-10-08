@@ -47,9 +47,11 @@ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,     # n
 from app import config as cfg                                                 # noqa: E402
 from app import runtime                                                       # noqa: E402
 from app.logger import log, setup_logging                                     # noqa: E402
-from app.services import access, billing, broadcast, forcejoin, settings      # noqa: E402
+from app.services import (access, billing, broadcast, channels, forcejoin,    # noqa: E402
+                          settings)
 from app.storage import db                                                    # noqa: E402
 from app.utils import esc, fmt_ts, human_size, money                          # noqa: E402
+from web import panels                                                        # noqa: E402
 
 STARTED_AT = time.time()
 COOKIE_NAME = "sb_session"
@@ -167,6 +169,9 @@ def layout(title: str, body: str, active: str = "", admin: bool = True) -> str:
     admin_nav = [
         ("/admin", "📊 Dashboard"),
         ("/admin/broadcast", "📢 Broadcast"),
+        ("/admin/channels", "📡 Channels"),
+        ("/admin/analytics", "📊 Analytics"),
+        ("/admin/links", "🔗 Links"),
         ("/admin/stores", "🏪 Stores"),
         ("/admin/files", "🗂 Files"),
         ("/admin/users", "👥 Users"),
@@ -460,6 +465,11 @@ def create_app() -> FastAPI:
             <select name=file_id>{_files_options()}</select>
             <label>Message (HTML allowed, <code>{{name}}</code> = user's name)</label>
             <textarea name=text rows=6 placeholder="আজকের নতুন ভিডিও এসেছে 🎬"></textarea>
+            <label>ইনলাইন বাটন — প্রতি লাইনে <code>লেবেল | লিংক</code>
+                   (একই লাইনে <code>&amp;&amp;</code> দিলে পাশাপাশি)</label>
+            <textarea name=buttons rows=3>{settings.get_str('BROADCAST_DEFAULT_BUTTONS') or "📢 জয়েন | https://t.me/mychannel"}</textarea>
+            <div class="chk"><input type=checkbox name=online value=1 checked id=ob>
+              <label for=ob>মেসেজের নিচে “🟢 অনলাইন — স্টোর খুলুন” বাটন দিন</label></div>
             <div class="row">
               <button class="ok" name=action value=start>🚀 তৈরি করে শুরু করুন</button>
               <button class="grey" name=action value=draft>📝 খসড়া রাখুন</button>
@@ -478,7 +488,8 @@ def create_app() -> FastAPI:
     @app.post("/admin/broadcast/new")
     async def studio_create(request: Request, audience: str = Form("all"),
                             file_id: int = Form(0), text: str = Form(""),
-                            action: str = Form("start")):
+                            action: str = Form("start"), buttons: str = Form(""),
+                            online: str = Form("")):
         blocked = _guard(request)
         if blocked:
             return blocked
@@ -494,15 +505,26 @@ def create_app() -> FastAPI:
         # status "queued": it starts now when the bot is online, otherwise the
         # scheduler starts it the moment the bot connects.
         campaign = broadcast.create_campaign(owner, text=body, audience=audience,
-                                            files=files, start=(action != "draft"))
+                                            files=files, start=(action != "draft"),
+                                            buttons=buttons,
+                                            online_button=1 if online else 0)
         campaign_id = campaign["id"]
         if action == "test":
             if not cfg.ADMIN_IDS:
                 return RedirectResponse("/admin/broadcast?warn=ADMIN_IDS+সেট+নেই,+টেস্ট+পাঠানো+যাবে+না",
                                         status_code=303)
-            await broadcast.test_send(campaign_id, [cfg.ADMIN_IDS[0]])
+            if not runtime.bot_online():
+                return RedirectResponse(
+                    "/admin/broadcast?warn=বট+অফলাইন+—+টেস্ট+পাঠানো+যাবে+না", status_code=303)
+            outcome = await broadcast.test_send(campaign_id, [cfg.ADMIN_IDS[0]])
+            if not outcome.get("ok"):
+                detail = (outcome.get("errors") or ["unknown"])[0]
+                return RedirectResponse(
+                    f"/admin/broadcast/{campaign_id}?warn=টেস্ট+ব্যর্থ:+{esc(detail)}"[:400],
+                    status_code=303)
             return RedirectResponse(
-                f"/admin/broadcast?flash=🧪+টেস্ট+পাঠানো+হয়েছে+(#{campaign_id})", status_code=303)
+                f"/admin/broadcast/{campaign_id}?flash=🧪+টেস্ট+সফল+(#{campaign_id})",
+                status_code=303)
         if action == "draft":
             return RedirectResponse(
                 f"/admin/broadcast?flash=📝+খসড়া+সেভ+(#{campaign_id})", status_code=303)
@@ -657,8 +679,9 @@ def create_app() -> FastAPI:
                 f"<td>{stats['files']}</td><td>{stats['views']}</td><td>{stats['grants']}</td>"
                 f"<td>{money(sales['revenue'], settings.get_str('CURRENCY', '৳'))}</td>"
                 f"<td>{len(db.plans(store['id'], only_active=True))}</td><td>{drip_txt}</td>"
-                f"<td><a class='btn grey' href='/s/{esc(store['slug'] or store['id'])}'>সাইটে দেখুন</a> "
-                f"<a class='btn' href='/admin/files?store={store['id']}'>ফাইল</a></td></tr>")
+                f"<td><a class='btn' href='/admin/stores/{store['id']}'>🛠 ম্যানেজ</a> "
+                f"<a class='btn grey' href='/admin/analytics/store/{store['id']}'>📊</a> "
+                f"<a class='btn grey' href='/s/{esc(store['slug'] or store['id'])}'>🌐</a></td></tr>")
         return layout("Stores", f"<h3>🏪 স্টোর</h3><table><tr><th>Store</th><th>Files</th><th>Views</th>"
                                 f"<th>Granted</th><th>Revenue</th><th>Plans</th><th>Drip</th><th></th></tr>"
                                 f"{''.join(rows)}</table>", "/admin/stores")
@@ -816,7 +839,8 @@ def create_app() -> FastAPI:
                 f"{esc(g['store_name'])} "
                 f"{'♾' if g['expires_at'] is None else _start(g['expires_at'], '%d %b')}"
                 for g in grants) or '<span class="muted">free</span>'
-            rows.append(f"<tr><td>{uid}</td><td>{esc(user.get('name') or '')}</td>"
+            rows.append(f"<tr><td><a href='/admin/users/{uid}'>{uid}</a></td>"
+                        f"<td>{esc(user.get('name') or '')}</td>"
                         f"<td>{esc(user.get('username') or '')}</td>"
                         f"<td>{_start(user.get('joined_at'))}</td><td>{badges}</td></tr>")
         return layout("Users", f"""<h3>👥 ইউজার ({len(everyone)})</h3>
@@ -1047,6 +1071,243 @@ def create_app() -> FastAPI:
                                  'attachment; filename="config.env"'})
 
     # ----------------------------------------------------------------- health
+    # ================================================= channels / composer (v3)
+    @app.get("/admin/channels", response_class=HTMLResponse)
+    async def admin_channels(request: Request, flash: str = "", warn: str = "",
+                             refresh: int = 0):
+        blocked = _guard(request)
+        if blocked:
+            return blocked
+        if refresh:
+            for row in db.join_channels():
+                if not row.get("chat_id"):
+                    info = await channels.add_channel(row["ref"], row.get("store_id"))
+                    if info.get("chat_id"):
+                        db.update_join_channel(row["id"], chat_id=info["chat_id"],
+                                               title=info.get("title") or row.get("title"))
+        body = panels.channels_body(flash, warn)
+        return layout("Channels", body, "/admin/channels")
+
+    @app.post("/admin/channels/add")
+    async def admin_channels_add(request: Request, ref: str = Form(""),
+                                 store_id: str = Form("")):
+        blocked = _guard(request)
+        if blocked:
+            return blocked
+        scope = int(store_id) if store_id.strip().isdigit() else None
+        result = await channels.add_channel(ref, scope)
+        if result.get("ok"):
+            return RedirectResponse(
+                f"/admin/channels?flash=✅+যোগ+হয়েছে:+{esc(result.get('title') or ref)}",
+                status_code=303)
+        return RedirectResponse(
+            f"/admin/channels?warn=চ্যানেল+পাওয়া+গেল+ন:+{esc(result.get('error') or '')}"[:400],
+            status_code=303)
+
+    @app.get("/admin/channels/toggle/{channel_id}")
+    async def admin_channels_toggle(request: Request, channel_id: int):
+        blocked = _guard(request)
+        if blocked:
+            return blocked
+        row = db.join_channel(channel_id)
+        if row:
+            db.update_join_channel(channel_id, enabled=0 if row.get("enabled") else 1)
+        return RedirectResponse("/admin/channels?flash=✅+আপডেট", status_code=303)
+
+    @app.get("/admin/channels/check/{channel_id}")
+    async def admin_channels_check(request: Request, channel_id: int):
+        blocked = _guard(request)
+        if blocked:
+            return blocked
+        row = db.join_channel(channel_id)
+        if row is None:
+            return RedirectResponse("/admin/channels?warn=চ্যানেল+নেই", status_code=303)
+        info = await channels.channel_info(row.get("chat_id") or row["ref"])
+        if info.get("ok"):
+            db.update_join_channel(channel_id, chat_id=info["chat_id"],
+                                   title=info.get("title") or row.get("title"),
+                                   last_check=time.time(), error="")
+            if info.get("chat_id"):
+                db.set_meta(f"chat_title:{info['chat_id']}", info.get("title") or "")
+            return RedirectResponse(
+                f"/admin/channels?flash=✅+{info.get('title')}+·+{info.get('members')}+সদস্য",
+                status_code=303)
+        db.update_join_channel(channel_id, last_check=time.time(),
+                               error=str(info.get("error") or "")[:180])
+        return RedirectResponse(
+            f"/admin/channels?warn={esc(str(info.get('error') or 'পাওয়া যায়নি'))}"[:400],
+            status_code=303)
+
+    @app.get("/admin/channels/delete/{channel_id}")
+    async def admin_channels_delete(request: Request, channel_id: int):
+        blocked = _guard(request)
+        if blocked:
+            return blocked
+        db.delete_join_channel(channel_id)
+        return RedirectResponse("/admin/channels?flash=🗑+মুছে+ফেলা+হলো", status_code=303)
+
+    @app.get("/admin/channels/compose", response_class=HTMLResponse)
+    async def admin_compose(request: Request, store: int = 0, flash: str = "", warn: str = ""):
+        blocked = _guard(request)
+        if blocked:
+            return blocked
+        composer = channels.composer_defaults(store or None)
+        return layout("Channel post", panels.compose_body(composer, store or None, flash, warn),
+                      "/admin/channels")
+
+    @app.post("/admin/channels/compose")
+    async def admin_compose_post(request: Request, target: str = Form(""),
+                                 text: str = Form(""), buttons: str = Form(""),
+                                 store_id: str = Form(""), file_ids: list[str] = Form(default=[]),
+                                 send_test: str = Form(""), link_limit: int = Form(-1)):
+        blocked = _guard(request)
+        if blocked:
+            return blocked
+        ids = [int(f) for f in file_ids if str(f).strip().isdigit()]
+        scope = int(store_id) if store_id.strip().isdigit() else None
+        composer = {"text": text, "buttons": buttons, "store_id": scope}
+        if send_test:
+            ok = await broadcast.test_send_text(text or "(ফাইল পোস্ট)", buttons or "")
+            return layout("Channel post",
+                          panels.compose_body(composer, scope,
+                                              "🧪 টেস্ট পাঠানো হয়েছে" if ok
+                                              else "", "" if ok else "টেস্ট পাঠানো যায়নি"),
+                          "/admin/channels")
+        if not target.strip():
+            return layout("Channel post",
+                          panels.compose_body(composer, scope, "",
+                                              "চ্যানেল বাছুন বা আগে একটা যোগ করুন"),
+                          "/admin/channels")
+        result = await channels.publish(target, text=text, file_ids=ids, buttons=buttons,
+                                       store_id=scope, link_limit=link_limit)
+        if result.get("ok"):
+            return layout("Channel post",
+                          panels.compose_body(composer, scope,
+                                              f"✅ পাঠানো হয়েছে (মেসেজ #{result.get('message_id')})",
+                                              ""),
+                          "/admin/channels")
+        return layout("Channel post",
+                      panels.compose_body(composer, scope, "",
+                                          f"❌ {result.get('error') or 'পাঠানো যায়নি'}"),
+                      "/admin/channels")
+
+    # ============================================================ analytics (v3)
+    @app.get("/admin/stores/{store_id}", response_class=HTMLResponse)
+    async def admin_store_detail(request: Request, store_id: int, flash: str = "", warn: str = ""):
+        blocked = _guard(request)
+        if blocked:
+            return blocked
+        store = db.store(store_id)
+        if store is None:
+            return RedirectResponse("/admin/stores?warn=স্টোর+নেই", status_code=303)
+        return layout(store["name"], panels.store_admin_body(store, flash, warn),
+                      "/admin/stores")
+
+    @app.get("/admin/analytics", response_class=HTMLResponse)
+    async def admin_analytics(request: Request, days: int = 14):
+        blocked = _guard(request)
+        if blocked:
+            return blocked
+        return layout("Analytics", panels.analytics_body(days), "/admin/analytics")
+
+    @app.get("/admin/analytics/store/{store_id}", response_class=HTMLResponse)
+    async def admin_store_analytics(request: Request, store_id: int):
+        blocked = _guard(request)
+        if blocked:
+            return blocked
+        return layout("Store analytics", panels.store_analytics_body(store_id),
+                      "/admin/analytics")
+
+    @app.get("/admin/analytics/file/{file_id}", response_class=HTMLResponse)
+    async def admin_file_watchers(request: Request, file_id: int):
+        blocked = _guard(request)
+        if blocked:
+            return blocked
+        return layout("File watchers", panels.file_watchers_body(file_id), "/admin/analytics")
+
+    @app.get("/admin/users/{user_id}", response_class=HTMLResponse)
+    async def admin_user_detail(request: Request, user_id: int):
+        blocked = _guard(request)
+        if blocked:
+            return blocked
+        return layout(f"User {user_id}", panels.user_detail_body(user_id), "/admin/users")
+
+    @app.post("/admin/users/{user_id}/message")
+    async def admin_user_message(request: Request, user_id: int, text: str = Form("")):
+        blocked = _guard(request)
+        if blocked:
+            return blocked
+        sent = await broadcast.test_send_text(text, "")
+        return RedirectResponse(
+            f"/admin/users/{user_id}?flash=" + ("✅+পাঠানো+হয়েছে" if sent else "❌+পাঠানো+যায়নি"),
+            status_code=303)
+
+    @app.get("/admin/users/{user_id}/ban")
+    async def admin_user_ban(request: Request, user_id: int):
+        blocked = _guard(request)
+        if blocked:
+            return blocked
+        db.ban_user(user_id, reason="banned from the website panel")
+        return RedirectResponse(f"/admin/users/{user_id}", status_code=303)
+
+    @app.get("/admin/users/{user_id}/unban")
+    async def admin_user_unban(request: Request, user_id: int):
+        blocked = _guard(request)
+        if blocked:
+            return blocked
+        db.unban_user(user_id)
+        return RedirectResponse(f"/admin/users/{user_id}", status_code=303)
+
+    # ======================================================= limited links (v3)
+    @app.get("/admin/links", response_class=HTMLResponse)
+    async def admin_links(request: Request, flash: str = "", warn: str = ""):
+        blocked = _guard(request)
+        if blocked:
+            return blocked
+        return layout("Links", panels.links_body(flash, warn), "/admin/links")
+
+    @app.post("/admin/links/new")
+    async def admin_links_new(request: Request, file_ids: list[str] = Form(default=[]),
+                              store_id: str = Form(""), max_clicks: int = Form(0),
+                              note: str = Form("")):
+        blocked = _guard(request)
+        if blocked:
+            return blocked
+        ids = [int(f) for f in file_ids if str(f).strip().isdigit()]
+        if not ids:
+            return RedirectResponse("/admin/links?warn=ফাইল+বাছুন", status_code=303)
+        token = db.create_link(0, ids, None, kind="limited", max_clicks=max(0, max_clicks),
+                               note=note)
+        label = f"{max_clicks} ক্লিক" if max_clicks else "আনলিমিটেড"
+        return RedirectResponse(
+            f"/admin/links?flash=🔗+তৈরি:+{label}+·+{token}", status_code=303)
+
+    @app.get("/admin/links/delete/{token}")
+    async def admin_links_delete(request: Request, token: str):
+        blocked = _guard(request)
+        if blocked:
+            return blocked
+        db.delete_link(token)
+        return RedirectResponse("/admin/links?flash=🗑+মুছে+ফেলা+হলো", status_code=303)
+
+    @app.post("/admin/stores/{store_id}/forcejoin")
+    async def admin_store_forcejoin(request: Request, store_id: int, ref: str = Form("")):
+        blocked = _guard(request)
+        if blocked:
+            return blocked
+        if ref.strip().lower() in ("off", "none", "-", "বন্ধ", "no"):
+            ref = ""
+        cleaned = forcejoin.normalize(ref) if ref.strip() else ""
+        db.set_store_forcejoin(store_id, cleaned)
+        forcejoin.clear_cache()
+        if cleaned:
+            info = await channels.add_channel(cleaned, store_id)
+            note = "✅ সেভ হয়েছে" + (f" · {info.get('title')}" if info.get("ok") else
+                                    " (চ্যানেল এখনো পাওয়া যায়নি)")
+        else:
+            note = "✅ এই স্টোরের আলাদা চ্যানেল বন্ধ করা হলো"
+        return RedirectResponse(f"/admin/stores?flash={note}", status_code=303)
+
     @app.get("/health")
     async def health() -> JSONResponse:
         stats = db.stats()
