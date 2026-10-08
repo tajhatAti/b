@@ -38,3 +38,6 @@ build/
 Thumbs.db
 .idea/
 .vscode/
+
+# demo env for the live preview (no real tokens)
+config.preview.env

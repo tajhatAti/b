@@ -31,8 +31,9 @@ PRIVATE_KEYS = ("API_ID", "ADMIN_IDS", "PAY_BKASH", "PAY_NAGAD", "PAY_ROCKET")
 # on a big repo).
 #: POSIX ERE (git grep -E) — no `(?:…)`, no lookahead; the last group is the value
 PATTERNS = (
-    # a literal assignment: API_HASH = "…", BOT_TOKEN: "…", STRING_SESSION = '…'
-    r'(API_HASH|BOT_TOKEN|STRING_SESSION|WEB_SECRET)[ \t]*[:=][ \t]*["\']([^"\']{20,})["\']',
+    # a literal assignment (with or without quotes):
+    #   API_HASH = "…"   BOT_TOKEN=123:AA…   STRING_SESSION: '…'
+    r'(API_HASH|BOT_TOKEN|STRING_SESSION|WEB_SECRET)[ \t]*[:=][ \t]*["\']?([A-Za-z0-9_.:+/=-]{20,})["\']?',
     # a bot token anywhere: 1234567890:AAE…
     r"([0-9]{8,10}:[A-Za-z0-9_-]{30,})",
 )
