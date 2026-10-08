@@ -116,6 +116,7 @@ def admin_settings_menu(session_ok: bool = False) -> list[list[Button]]:
         [Button.inline("🔍 File search", "adm:file_search"), Button.inline("🔗 Links manage", "adm:links_manage")],
         [Button.inline("🚫 Ban user", "adm:ban_menu"), Button.inline("✅ Unban user", "adm:unban_menu")],
         [Button.inline("👋 Welcome", "adm:welcome_set"), Button.inline("🌐 Language", "adm:lang_info")],
+        [Button.inline("📝 বটের মেসেজ এডিট", "tx:home"), Button.inline("📡 Channels", "ch:home")],
         [Button.inline("📢 Force Join", "adm:fj"), Button.inline("🛠 Admin help", "adm:help")],
         [Button.inline("🔙 Back to panel", "adm:back")],
     ]

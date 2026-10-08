@@ -17,7 +17,7 @@ from telethon.tl.custom import Button
 
 from app import runtime, ui
 from app.handlers.router import route
-from app.handlers.state import ask
+from app.handlers.state import ask, cancel_buttons
 from app.services import access, channels, forcejoin
 from app.storage import db
 from app.utils import esc, fmt_ts, safe_int
@@ -475,3 +475,142 @@ async def store_forcejoin_off(event, rest: str) -> None:
     forcejoin.clear_cache()
     await event.answer("✅ বন্ধ করা হলো", alert=True)
     await store_forcejoin_screen(event, str(store_id))
+
+
+# =============================================================== bot texts (v3)
+# “একটা লাইন বদলানোর জন্য পুরো সিস্টেম বানাতে হয়” — no more: every message the bot
+# sends is listed here and can be rewritten from the panel (or the website:
+# /admin/texts). The default wording is kept as a fallback, so ♻️ always works.
+_text_lang = {}          # admin_id → "bn" | "en"
+
+
+def _texts_lang(admin_id: int) -> str:
+    return _text_lang.get(admin_id, "bn")
+
+
+@route("tx:home")
+async def texts_home(event, rest: str) -> None:
+    if not _is_admin(event):
+        await event.answer("Admins only.", alert=True)
+        return
+    from app.services import bot_texts
+
+    lang = _texts_lang(event.sender_id)
+    groups = bot_texts.catalog(lang)
+    edited = sum(1 for g in groups for row in g["rows"] if row["edited"])
+    lines = [
+        "📝 <b>বটের মেসেজ</b>",
+        "",
+        "বট ইউজারকে যা লেখে, সব এখান থেকেই বদলানো যায় — কোড এডিট বা রিস্টার্ট লাগে না।",
+        f"এখন <b>{'বাংলা' if lang == 'bn' else 'English'}</b> ভার্সন দেখছেন · "
+        f"নিজের লেখা: <b>{edited}</b> টি।",
+        "",
+        "একটা গ্রুপ বেছে নিন 👇",
+    ]
+    buttons = [[Button.inline(f"{g['group']} ({len(g['rows'])})", f"tx:g:{i}")]
+               for i, g in enumerate(groups)]
+    buttons.append([Button.inline("🌐 English ভার্সন দেখুন" if lang == "bn"
+                                  else "🇧🇩 বাংলা ভার্সন দেখুন", "tx:lang")])
+    buttons.append([Button.inline("🔙 প্যানেল", "adm:back")])
+    await _render(event, "\n".join(lines), buttons)
+    await event.answer()
+
+
+@route("tx:lang")
+async def texts_lang(event, rest: str) -> None:
+    if not _is_admin(event):
+        return
+    _text_lang[event.sender_id] = "en" if _texts_lang(event.sender_id) == "bn" else "bn"
+    await texts_home(event, "")
+
+
+@route("tx:g:")
+async def texts_group(event, rest: str) -> None:
+    if not _is_admin(event):
+        return
+    from app.services import bot_texts
+
+    groups = bot_texts.catalog(_texts_lang(event.sender_id))
+    index = safe_int(rest.split(":")[0])
+    if not 0 <= index < len(groups):
+        await event.answer("গ্রুপটি পাওয়া গেল না", alert=True)
+        return
+    group = groups[index]
+    lines = [f"{group['group']}", ""]
+    buttons = []
+    for row in group["rows"]:
+        mark = "✏️" if row["edited"] else "•"
+        lines.append(f"{mark} <b>{esc(row['label'])}</b> — <code>{esc(row['key'])}</code>")
+        buttons.append([Button.inline(f"{mark} {_short(row['label'], 34)}",
+                                      f"tx:k:{row['key']}")])
+    buttons.append([Button.inline("🔙 গ্রুপ তালিকা", "tx:home")])
+    await _render(event, "\n".join(lines), buttons)
+    await event.answer()
+
+
+@route("tx:k:")
+async def texts_one(event, rest: str) -> None:
+    if not _is_admin(event):
+        return
+    from app.services import bot_texts
+
+    key = rest.split(":")[0]
+    lang = _texts_lang(event.sender_id)
+    current = bot_texts.override(key, lang) or bot_texts.default(key, lang)
+    default = bot_texts.default(key, lang)
+    lines = [
+        f"📝 <b>{esc(bot_texts.label(key))}</b>",
+        f"কী: <code>{esc(key)}</code> · ভাষা: {'বাংলা' if lang == 'bn' else 'English'}",
+        "",
+        "এখন যা যায় 👇",
+        f"<blockquote>{esc(current) or '(খালি)'}</blockquote>",
+    ]
+    if bot_texts.is_overridden(key, lang):
+        lines += ["", "♻️ ডিফল্ট:", f"<blockquote>{esc(default)}</blockquote>"]
+    buttons = [
+        [Button.inline("✏️ লেখা বদলান", f"tx:e:{key}")],
+        [Button.inline("♻️ ডিফল্ট ফিরিয়ে দিন", f"tx:r:{key}")] if bot_texts.is_overridden(key, lang) else [],
+        [Button.inline("🔙 তালিকায় ফিরুন", "tx:home")],
+    ]
+    await _render(event, "\n".join(lines), [row for row in buttons if row])
+    await event.answer()
+
+
+@route("tx:e:")
+async def texts_edit(event, rest: str) -> None:
+    if not _is_admin(event):
+        return
+    from app.services import bot_texts
+
+    key = rest.split(":")[0]
+    lang = _texts_lang(event.sender_id)
+    ask(event.sender_id, "text_edit", key=key, lang=lang)
+    await event.respond(
+        f"✏️ <b>{esc(bot_texts.label(key))}</b> — নতুন লেখা পাঠান।\n\n"
+        "<i>HTML বন্ধ/খোলা ট্যাগ ব্যবহার করতে পারেন (&lt;b&gt;, &lt;a&gt;) · "
+        "খালি পাঠালে ডিফল্ট ফিরে আসবে · বাতিল করতে নিচের বাটন</i>",
+        buttons=cancel_buttons())
+    await event.answer()
+
+
+@route("tx:r:")
+async def texts_reset(event, rest: str) -> None:
+    if not _is_admin(event):
+        return
+    from app.services import bot_texts
+
+    key = rest.split(":")[0]
+    bot_texts.set(key, "-", _texts_lang(event.sender_id))
+    await event.answer("♻️ ডিফল্ট ফিরে এসেছে")
+    await texts_one(event, key)
+
+
+@route("tx:allreset")
+async def texts_reset_all(event, rest: str) -> None:
+    if not _is_admin(event):
+        return
+    from app.services import bot_texts
+
+    count = bot_texts.reset_all()
+    await event.answer(f"♻️ {count} টি মেসেজ ডিফল্টে ফিরেছে")
+    await texts_home(event, "")

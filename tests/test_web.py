@@ -480,3 +480,79 @@ def test_campaign_buttons_can_be_turned_off_per_campaign(client):
     from app.services import broadcast as broadcast_service
     labels = [label for row in broadcast_service.campaign_buttons(campaign) for label, _ in row]
     assert not any("অনলাইন" in label for label in labels)
+
+
+# ------------------------------------------------- 🔐 security / 📝 bot texts / 🗑 purge
+def test_security_page_shows_the_leaked_file_and_the_fix(client):
+    """The owner pasted a crash log that leaked API_HASH — the panel must say so."""
+    page = client.get("/admin/security", headers=_auth())
+    assert page.status_code == 200
+    assert "নিরাপত্তা" in page.text
+    assert "website.example.py" in page.text          # the real finding, on line 71
+    assert "Revoke" in page.text                      # step one of the fix
+    assert "API_HASH" in page.text
+
+
+def test_bot_text_overrides_reach_the_bot(client):
+    from app import i18n
+    from app.services import bot_texts
+
+    assert "স্টোরে স্বাগতম" in i18n.t(USER_ID, "home_banner")
+    save = client.post("/admin/texts/save", headers=_auth(),
+                       data={"key": "home_banner", "lang": "bn",
+                             "value": "আসসালামু আলাইকুম — আমাদের স্টোরে স্বাগতম!"},
+                       follow_redirects=False)
+    assert save.status_code == 303
+    assert "আসসালামু আলাইকুম" in i18n.t(USER_ID, "home_banner")
+    assert bot_texts.is_overridden("home_banner")
+    assert "Welcome to the store" in bot_texts.render("home_banner", "en")   # en untouched
+    # ♻️ reset brings the built-in wording back
+    client.post("/admin/texts/save", headers=_auth(),
+                data={"key": "home_banner", "lang": "bn", "value": "-"})
+    assert "স্টোরে স্বাগতম" in i18n.t(USER_ID, "home_banner")
+
+
+def test_bot_texts_page_lists_every_group(client):
+    page = client.get("/admin/texts", headers=_auth())
+    assert page.status_code == 200
+    assert "বটের মেসেজ" in page.text
+    assert "home_banner" in page.text
+    assert "media_only" in page.text                  # not in i18n, still editable
+
+
+def test_mass_delete_files_and_users(client):
+    store = _store("Movies")
+    extra = [db.add_file(store["id"], f"Film {i}", "Video", -100, 100 + i)
+             for i in range(3)]
+    page = client.post("/admin/files/bulk-delete", headers=_auth(),
+                       data={"ids": f"{extra[0]}, {extra[1]}"}, follow_redirects=False)
+    assert page.status_code == 303
+    assert db.file(extra[0]) is None and db.file(extra[1]) is None
+    assert db.file(extra[2]) is not None              # untouched
+
+    db.touch_user(777, "Old User", "old")
+    db.touch_user(778, "Keep Me", "keep")
+    gone = client.post("/admin/users/bulk-delete", headers=_auth(),
+                       data={"ids": "777"}, follow_redirects=False)
+    assert gone.status_code == 303
+    assert db.user(777) is None
+    assert db.user(778) is not None
+    assert client.get("/admin/users", headers=_auth()).status_code == 200
+
+
+def test_old_users_can_be_purged_safely(client):
+    import time as _time
+
+    db.touch_user(ADMIN_ID, "Owner", "owner")
+    db.touch_user(901, "Sleepy", "sleepy")
+    db.touch_user(902, "Fresh", "fresh")
+    db._run("UPDATE users SET last_seen = ? WHERE user_id = ?",
+            (_time.time() - 400 * 86400, 901))         # 400 days ago
+    preview = client.get("/admin/users/purge?days=90", headers=_auth())
+    assert preview.status_code == 200
+    assert "Sleepy" in preview.text and "Fresh" not in preview.text
+    client.post("/admin/users/purge", headers=_auth(), data={"days": "90"},
+                follow_redirects=False)
+    assert db.user(901) is None
+    assert db.user(902) is not None
+    assert db.user(ADMIN_ID) is not None               # admins are never purged

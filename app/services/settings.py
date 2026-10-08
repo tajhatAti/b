@@ -197,6 +197,28 @@ REGISTRY: list[Group] = [
         ],
     ),
     Group(
+        key="alerts", label="নোটিফিকেশন (অ্যাডমিন অ্যালার্ট)", icon="🔔",
+        blurb="নতুন ইউজার, নতুন অর্ডার, নতুন মেসেজ বা আপলোডে আটকে গেলে অ্যাডমিনকে "
+              "সাথে সাথে জানাবে। অনেক ভিড় হলে ALERT_CHANNEL-এ একটা প্রাইভেট গ্রুপ "
+              "দিন — সব অ্যালার্ট সেখানেই জমা হবে।",
+        settings=[
+            _s("ALERT_ENABLED", "সব নোটিফিকেশন চালু", "alerts", kind="bool", default=True),
+            _s("ALERT_NEW_USER", "নতুন ইউজার বটে এলেই জানাও", "alerts", kind="bool",
+               default=True),
+            _s("ALERT_ORDER", "নতুন অর্ডার/পেমেন্ট এলেই জানাও", "alerts", kind="bool",
+               default=True),
+            _s("ALERT_TICKET", "নতুন সাপোর্ট মেসেজ এলেই জানাও", "alerts", kind="bool",
+               default=True),
+            _s("ALERT_STUCK_UPLOAD", "কেউ আপলোডে আটকে গেলে জানাও", "alerts", kind="bool",
+               default=True,
+               hint="ভিডিও/ছবির বদলে অন্য কিছু পাঠালে বা আপলোডে সমস্যা হলে অ্যালার্ট"),
+            _s("ALERT_BROADCAST", "ব্রডকাস্ট শেষ হলে রিপোর্ট", "alerts", kind="bool",
+               default=True),
+            _s("ALERT_CHANNEL", "অ্যালার্ট কোথায় যাবে", "alerts",
+               placeholder="@my_admin_inbox / -1001234567890 (খালি = অ্যাডমিনের DM)"),
+        ],
+    ),
+    Group(
         key="site", label="ওয়েবসাইট", icon="🌐",
         blurb="পাবলিক সাইটের নাম, ট্যাগলাইন ও টাইমজোন।",
         settings=[

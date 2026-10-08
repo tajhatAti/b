@@ -11,7 +11,7 @@ from app import config as cfg, i18n, keyboards, runtime, texts, ui
 from app.handlers.router import route
 from app.handlers import state
 from app.logger import log
-from app.runtime import bot
+from app.runtime import bot, spawn
 from app.services import access, flow
 from app.services.sender import deliver
 from app.storage import db
@@ -197,6 +197,11 @@ async def start_handler(event: events.NewMessage.Event) -> None:
     is_new = db.touch_user(user_id,
                            getattr(sender, "first_name", None),
                            getattr(sender, "username", None))
+    if is_new:
+        # 🔔 “নতুন ইউজার এলেই জানাও” — fire and forget, never slow down /start
+        from app.services import alerts
+        spawn(alerts.new_user(user_id, getattr(sender, "first_name", "") or "",
+                              getattr(sender, "username", "") or ""))
 
     parts = (event.raw_text or "").strip().split(maxsplit=1)
     command = parts[0].split("@")[0].lower()

@@ -426,6 +426,54 @@ class Database:
     def user(self, user_id: int) -> dict | None:
         return self._dict(self._one("SELECT * FROM users WHERE user_id = ?", (user_id,)))
 
+    def delete_user(self, user_id: int) -> bool:
+        """Remove one user and every trace of them (grants, orders, events…).
+
+        Nothing that belongs to a *store* is touched — only this person's own data.
+        """
+        row = self._one("SELECT 1 FROM users WHERE user_id = ?", (user_id,))
+        if not row:
+            return False
+        for table, column in (
+            ("users", "user_id"), ("grants", "user_id"), ("orders", "user_id"),
+            ("events", "user_id"), ("file_views", "user_id"), ("favorites", "user_id"),
+            ("drip_subs", "user_id"), ("drip_sent", "user_id"), ("link_uses", "user_id"),
+            ("join_prompts", "user_id"), ("tickets", "user_id"), ("referrals", "user_id"),
+            ("requests", "user_id"), ("bans", "user_id"),
+        ):
+            try:
+                self._run(f"DELETE FROM {table} WHERE {column} = ?", (user_id,))
+            except Exception:
+                pass                      # a table that does not exist in this build
+        return True
+
+    def delete_users(self, user_ids: Iterable[int]) -> int:
+        return sum(1 for uid in unique_keep_order([int(i) for i in user_ids if i])
+                   if self.delete_user(uid))
+
+    def purge_user_ids(self, *, days: int = 0, never_started: bool = False,
+                       keep_admins: Iterable[int] = ()) -> list[int]:
+        """Which users *would* be deleted — the panel shows this before deleting.
+
+        ``days`` = nobody who was active in the last N days (0 = ignore activity).
+        ``never_started`` = only people who joined but never sent a message/started.
+        """
+        keep = {int(i) for i in keep_admins if i}
+        rows = self._q("SELECT user_id, joined_at, last_seen FROM users")
+        cutoff = time.time() - days * 86400 if days else 0
+        out: list[int] = []
+        for row in rows:
+            uid = row["user_id"]
+            if uid in keep:
+                continue
+            seen = row["last_seen"] or row["joined_at"] or 0
+            if cutoff and seen >= cutoff:
+                continue
+            if never_started and seen:
+                continue
+            out.append(uid)
+        return out
+
     def all_user_ids(self) -> list[int]:
         return [r["user_id"] for r in self._q("SELECT user_id FROM users ORDER BY user_id")]
 
@@ -597,6 +645,14 @@ class Database:
         self._run("DELETE FROM link_files WHERE file_id = ?", (file_id,))
         self._run("DELETE FROM drip_sent WHERE file_id = ?", (file_id,))
         return store_id
+
+    def delete_files(self, file_ids: Iterable[int]) -> int:
+        """🗑 Delete many files at once — “ভিডিও একসাথে অনেকগুলো মুছে ফেলব”. """
+        count = 0
+        for file_id in unique_keep_order([int(i) for i in file_ids if i]):
+            if self.delete_file(file_id) is not None:
+                count += 1
+        return count
 
     def move_file(self, file_id: int, store_id: int) -> bool:
         if not self._one("SELECT 1 FROM stores WHERE id = ?", (store_id,)):

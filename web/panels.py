@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import time
 
-from app import runtime
+from app import config as cfg, runtime
 from app.services import channels, forcejoin, settings
 from app.storage import db
 from app.utils import esc, fmt_ts
@@ -544,6 +544,39 @@ def files_tools_body() -> str:
         <a class="btn warn" href="/admin/files/dedupe">🧹 ডুপ্লিকেট পরিষ্কার</a>
       </p>
       {f'<table><tr><th>নাম</th><th>স্টোর</th><th>কপি</th></tr>{dup_rows}</table>' if dups else ''}
+    </div>
+
+
+<div class="card">
+  <h4>🗑 একসাথে অনেক ভিডিও মুছুন (mass delete)</h4>
+  <p class="muted">নিচের বক্সে ফাইলের ID গুলো কমা বা নতুন লাইনে লিখুন — সব একবারে মুছে যাবে।
+  ফাইল মুছলে তার লিংক/ড্রিপ/ফেভারিটও পরিষ্কার হয় (কোনো ভাঙা লিংক থাকে না)।</p>
+  <form method=post action="/admin/files/bulk-delete"
+        onsubmit="return confirm('সবগুলো ফাইল মুছে ফেলবেন? এটা ফেরানো যাবে না।')">
+    <textarea name="ids" rows="3" placeholder="12, 15, 18"></textarea>
+    <div class="row" style="margin-top:8px">
+      <button class="btn bad" type="submit">🗑 সব মুছে ফেলুন</button>
+      <span class="muted">টেবিলের ID কলাম দেখে নিন — ভুল ID হলে কিছুই মুছবে না।</span>
+    </div>
+  </form>
+</div>"""
+
+
+def users_tools_body(total: int = 0) -> str:
+    """🧹 Mass-delete helpers for the 👥 Users page."""
+    everyone = db.all_user_ids()
+    stale = len(db.purge_user_ids(days=90, keep_admins=cfg.ADMIN_IDS)) if everyone else 0
+    fresh = len(everyone) - stale
+    return f"""<div class="card">
+      <h4>🧹 ইউজার পরিষ্কার (mass delete)</h4>
+      <p class="muted">টেবিলের বাঁ দিকের বক্সে টিক দিয়ে একসাথে অনেক ইউজার মুছে ফেলা যায়।
+      অ্যাডমিন অ্যাকাউন্ট কখনো মুছবে না।</p>
+      <p class="row">
+        <span class="pill">মোট {total or len(everyone)} জন</span>
+        <span class="pill">৯০ দিন অ্যাকটিভ {fresh} জন</span>
+        <span class="pill">পুরোনো {stale} জন</span>
+        <a class="btn warn" href="/admin/users/purge?days=90">🧹 পুরোনো ইউজার দেখুন</a>
+      </p>
     </div>"""
 
 

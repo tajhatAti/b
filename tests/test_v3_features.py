@@ -1154,3 +1154,107 @@ async def test_channel_post_with_file_delivers_it_with_buttons(clean, monkeypatc
     peer, sent_file, caption, buttons = calls[0]
     assert sent_file == file_id and "একদম নতুন" in caption
     assert buttons and buttons[0][0][1] == "https://example.com"
+
+
+# ------------------------------------------------- 📝 editable bot texts (panel)
+def test_every_i18n_key_is_listed_and_editable(clean):
+    """“একটা লাইন বদলানোর জন্য পুরো সিস্টেম বানাতে হয়” — no more."""
+    from app import i18n
+    from app.services import bot_texts
+
+    catalog = [row for group in bot_texts.catalog() for row in group["rows"]]
+    keys = {row["key"] for row in catalog}
+    assert set(i18n.STRINGS) <= keys                     # nothing is left out
+    assert {"media_only", "gate_title", "join_button"} <= keys
+    for key in list(i18n.STRINGS)[:10]:                  # every one has a default
+        assert bot_texts.default(key, "bn")
+
+
+def test_an_owner_edit_wins_over_the_builtin_text(clean):
+    from app import i18n
+    from app.services import bot_texts
+
+    bot_texts.set("home_banner", "স্বাগতম ভাই! 👋")
+    assert i18n.t(USER_ID, "home_banner") == "স্বাগতম ভাই! 👋"
+    bot_texts.set("media_only", "❌ শুধু ভিডিও বা ছবি দিন ভাই।")
+    from app.services import media_guard
+    assert "শুধু ভিডিও বা ছবি দিন ভাই" in media_guard.reject_text("text")
+    bot_texts.set("join_button", "🔔 জয়েন করলাম")
+    from app.services import forcejoin
+    buttons = forcejoin.gate_keyboard(USER_ID, 1, [{"title": "A", "ref": "@a",
+                                                    "invite": "https://t.me/a"}])
+    assert buttons[-1][0].text == "🔔 জয়েন করলাম"
+    assert bot_texts.set("home_banner", "-")[0] is True
+    assert i18n.t(USER_ID, "home_banner") == i18n.STRINGS["home_banner"]["bn"]
+    assert "স্টোরে স্বাগতম" in i18n.t(USER_ID, "home_banner")
+
+
+def test_placeholders_still_work_after_an_edit(clean):
+    from app.services import bot_texts
+
+    bot_texts.set("gate_title", "আগে {channels} জয়েন করুন")
+    text = bot_texts.render("gate_title", channels="  • My Channel")
+    assert "My Channel" in text
+    bot_texts.set("gate_title", "-")
+
+
+def test_the_panel_lists_grouped_texts_with_a_reset(clean):
+    from app.services import bot_texts
+
+    groups = bot_texts.catalog()
+    assert groups and all(group["group"] and group["rows"] for group in groups)
+    row = next(r for g in groups for r in g["rows"] if r["key"] == "home_banner")
+    assert row["edited"] is False and row["default"]
+    bot_texts.set("home_banner", "নতুন লেখা")
+    row = next(r for g in bot_texts.catalog() for r in g["rows"] if r["key"] == "home_banner")
+    assert row["edited"] is True and row["value"] == "নতুন লেখা"
+    assert bot_texts.reset_all() >= 1
+    assert bot_texts.override("home_banner") == ""
+
+
+# ------------------------------------------------------------------- 🔔 alerts
+def test_alerts_are_switchable_one_by_one(clean):
+    from app.services import alerts, settings as settings_service
+
+    assert alerts.enabled("new_user") is True
+    settings_service.set("ALERT_NEW_USER", "false")
+    assert alerts.enabled("new_user") is False
+    assert alerts.enabled("order") is True               # only that one is off
+    settings_service.set("ALERT_ENABLED", "false")
+    assert alerts.enabled("order") is False
+    settings_service.set("ALERT_ENABLED", "true")
+    settings_service.set("ALERT_NEW_USER", "true")
+
+
+def test_the_same_alert_is_not_repeated_within_the_cooldown(clean):
+    from app.services import alerts
+
+    alerts._last_sent.clear()
+    assert alerts.throttled("stuck", "42") is False
+    alerts.mark("stuck", "42")
+    assert alerts.throttled("stuck", "42") is True
+    assert alerts.throttled("stuck", "43") is False      # another user gets through
+    alerts._last_sent.clear()
+
+
+@pytest.mark.asyncio
+async def test_a_new_order_and_new_user_alert_reach_the_admin_inbox(clean, monkeypatch):
+    from app import runtime
+    from app.services import alerts, settings as settings_service
+
+    sent: list[tuple] = []
+
+    class StubBot:
+        async def send_message(self, target, text, **kwargs):
+            sent.append((target, text))
+            return object()
+
+    monkeypatch.setattr(runtime, "bot", StubBot(), raising=False)
+    settings_service.set("ALERT_CHANNEL", "@admin_inbox")
+    await alerts.new_user(USER_ID, "Rahim", "rahim")
+    await alerts.new_order({"id": 5, "user_id": USER_ID, "amount": 199, "currency": "৳"})
+    assert sent and all(target == "@admin_inbox" for target, _ in sent)
+    assert any("নতুন ইউজার" in text for _, text in sent)
+    assert any("নতুন অর্ডার #5" in text for _, text in sent)
+    settings_service.set("ALERT_CHANNEL", "")
+    alerts._last_sent.clear()

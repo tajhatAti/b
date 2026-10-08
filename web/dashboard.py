@@ -32,6 +32,7 @@ import hashlib
 import hmac
 import html
 import os
+import re
 import secrets
 import sys
 import time
@@ -47,8 +48,8 @@ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,     # n
 from app import config as cfg                                                 # noqa: E402
 from app import runtime                                                       # noqa: E402
 from app.logger import log, setup_logging                                     # noqa: E402
-from app.services import (access, billing, broadcast, channels, forcejoin,    # noqa: E402
-                          settings)
+from app.services import (access, billing, bot_texts, broadcast, channels,    # noqa: E402
+                          forcejoin, secrets_guard, settings)
 from app.storage import db                                                    # noqa: E402
 from app.utils import esc, fmt_ts, human_size, money                          # noqa: E402
 from web import panels                                                        # noqa: E402
@@ -185,6 +186,7 @@ def layout(title: str, body: str, active: str = "", admin: bool = True) -> str:
         ("/admin/broadcast", "📢 Broadcast"),
         ("/admin/channels", "📡 Channels"),
         ("/admin/analytics", "📊 Analytics"),
+        ("/admin/texts", "📝 Bot texts"),
         ("/admin/links", "🔗 Links"),
         ("/admin/stores", "🏪 Stores"),
         ("/admin/files", "🗂 Files"),
@@ -193,6 +195,7 @@ def layout(title: str, body: str, active: str = "", admin: bool = True) -> str:
         ("/admin/download", "📥 Export"),
         ("/admin/settings", "🛠 Settings"),
         ("/admin/self-test", "🩺 Health"),
+        ("/admin/security", "🔐 Security"),
     ]
     items = public_nav + admin_nav
     nav = "".join(
@@ -818,6 +821,22 @@ def create_app() -> FastAPI:
         {''.join(rows)}</table>"""
         return layout("Files", body, "/admin/files")
 
+    @app.post("/admin/files/bulk-delete")
+    async def admin_files_bulk_delete(request: Request):
+        blocked = _guard(request)
+        if blocked:
+            return blocked
+        form = await request.form()
+        raw = str(form.get("ids", ""))
+        ids = [int(part) for part in re.findall(r"\d+", raw)]
+        if not ids:
+            return RedirectResponse("/admin/files?flash=কোনো+ID+দেননি",
+                                    status_code=303)
+        count = db.delete_files(ids)
+        db.log_event("files_purged", user_id=0, detail=f"ids={ids[:40]} n={count}")
+        return RedirectResponse(f"/admin/files?flash=🗑+{count}+টি+ফাইল+মুছে+ফেলা+হলো",
+                                status_code=303)
+
     @app.get("/admin/files/broadcast/{file_id}", response_class=HTMLResponse)
     async def file_broadcast(request: Request, file_id: int):
         """📢 per-video broadcast — the same campaign engine as the studio."""
@@ -951,14 +970,98 @@ def create_app() -> FastAPI:
                 f"{esc(g['store_name'])} "
                 f"{'♾' if g['expires_at'] is None else _start(g['expires_at'], '%d %b')}"
                 for g in grants) or '<span class="muted">free</span>'
-            rows.append(f"<tr><td><a href='/admin/users/{uid}'>{uid}</a></td>"
+            box = (f'<input type="checkbox" name="ids" value="{uid}">')
+            rows.append(f"<tr><td>{box} <a href='/admin/users/{uid}'>{uid}</a></td>"
                         f"<td>{esc(user.get('name') or '')}</td>"
                         f"<td>{esc(user.get('username') or '')}</td>"
-                        f"<td>{_start(user.get('joined_at'))}</td><td>{badges}</td></tr>")
+                        f"<td>{_start(user.get('joined_at'))}</td><td>{badges}</td>"
+                        f"<td><a class='btn bad' href='/admin/users/{uid}/delete"
+                        f"?confirm=1'>🗑</a></td></tr>")
         return layout("Users", f"""<h3>👥 ইউজার ({len(everyone)})</h3>
         <form method=get><input name=q placeholder="id বা নাম" value="{esc(q)}"></form>
-        <table><tr><th>ID</th><th>Name</th><th>Username</th><th>Joined</th><th>Access</th></tr>
-        {''.join(rows)}</table>""", "/admin/users")
+        {panels.users_tools_body(len(everyone))}
+        <form method=post action="/admin/users/bulk-delete"
+              onsubmit="return confirm('নির্বাচিত ইউজারদের সব ডেটা মুছে যাবে। চালিয়ে যাবেন?')">
+        <table><tr><th></th><th>ID</th><th>Name</th><th>Username</th><th>Joined</th>
+        <th>Access</th><th></th></tr>
+        {''.join(rows)}</table>
+        <div class="row" style="margin-top:10px">
+          <button class="btn bad" type="submit">🗑 নির্বাচিত ইউজার মুছুন</button>
+        </div></form>""", "/admin/users")
+
+    @app.post("/admin/users/bulk-delete")
+    async def admin_users_bulk_delete(request: Request):
+        blocked = _guard(request)
+        if blocked:
+            return blocked
+        form = await request.form()
+        ids = [int(part) for part in re.findall(r"\d+", str(form.get("ids", "")))]
+        admins = set(cfg.ADMIN_IDS)
+        ids = [uid for uid in ids if uid not in admins]
+        count = db.delete_users(ids)
+        db.log_event("users_purged", user_id=0, detail=f"n={count}")
+        return RedirectResponse(f"/admin/users?flash=🗑+{count}+জন+ইউজার+মুছে+ফেলা+হলো",
+                                status_code=303)
+
+    @app.get("/admin/users/purge", response_class=HTMLResponse)
+    async def admin_users_purge_preview(request: Request, days: int = 90,
+                                        never_started: int = 0):
+        """🧹 পুরোনো ইউজার একসাথে পরিষ্কার — আগে দেখায় কতজন যাবে, তারপর মোছে।"""
+        blocked = _guard(request)
+        if blocked:
+            return blocked
+        ids = db.purge_user_ids(days=days, never_started=bool(never_started),
+                                keep_admins=cfg.ADMIN_IDS)
+        sample = "".join(
+            f"<tr><td>{uid}</td><td>{esc((db.user(uid) or {}).get('name') or '')}</td>"
+            f"<td>{_start((db.user(uid) or {}).get('last_seen'))}</td></tr>"
+            for uid in ids[:100])
+        body = f"""
+        <h3>🧹 পুরোনো ইউজার পরিষ্কার</h3>
+        <p class="muted">যারা অনেক দিন বট ব্যবহার করেননি (বা কখনো <code>/start</code> দেননি)
+        — এখান থেকে একবারে মুছে ফেলা যায়। অ্যাডমিনরা কখনো মুছবে না।</p>
+        <form method=get class="row">
+          <label>কত দিন অ্যাকটিভ না <input name="days" value="{days}" size="5"></label>
+          <label><input type="checkbox" name="never_started" value="1"
+            {'checked' if never_started else ''}> শুধু যারা কখনো শুরুই করেনি</label>
+          <button class="btn grey" type="submit">🔍 কতজন হবে দেখুন</button>
+        </form>
+        <p><b>{len(ids)}</b> জন ইউজার মুছে ফেলা হবে।</p>
+        <form method=post action="/admin/users/purge"
+              onsubmit="return confirm('{len(ids)} জন ইউজারের সব ডেটা মুছে যাবে। নিশ্চিত?')">
+          <input type="hidden" name="days" value="{days}">
+          <input type="hidden" name="never_started" value="{1 if never_started else 0}">
+          <button class="btn bad" type="submit">🗑 {len(ids)} জন মুছে ফেলুন</button>
+        </form>
+        {f'<table><tr><th>ID</th><th>নাম</th><th>শেষ দেখা</th></tr>{sample}</table>' if ids else ''}
+        """
+        return layout("Purge users", body, "/admin/users")
+
+    @app.post("/admin/users/purge")
+    async def admin_users_purge(request: Request):
+        blocked = _guard(request)
+        if blocked:
+            return blocked
+        form = await request.form()
+        days = int(str(form.get("days", "90")) or 90)
+        never = str(form.get("never_started", "0")) == "1"
+        ids = db.purge_user_ids(days=days, never_started=never, keep_admins=cfg.ADMIN_IDS)
+        count = db.delete_users(ids)
+        db.log_event("users_purged", user_id=0, detail=f"days={days} n={count}")
+        return RedirectResponse(f"/admin/users?flash=🧹+{count}+জন+পুরোনো+ইউজার+মুছে+ফেলা+হলো",
+                                status_code=303)
+
+    @app.get("/admin/users/{user_id}/delete")
+    async def admin_user_delete(request: Request, user_id: int, confirm: int = 0):
+        blocked = _guard(request)
+        if blocked:
+            return blocked
+        if user_id in set(cfg.ADMIN_IDS):
+            return RedirectResponse("/admin/users?flash=অ্যাডমিনকে+মোছা+যাবে+না",
+                                    status_code=303)
+        ok = db.delete_user(user_id)
+        label = "🗑+ইউজার+মুছে+ফেলা+হলো" if ok else "ইউজার+নেই"
+        return RedirectResponse(f"/admin/users?flash={label}", status_code=303)
 
     # -------------------------------------------------------------- download
     @app.get("/admin/download", response_class=HTMLResponse)
@@ -1304,6 +1407,89 @@ def create_app() -> FastAPI:
                       "/admin/channels")
 
     # ============================================================ analytics (v3)
+    @app.get("/admin/texts", response_class=HTMLResponse)
+    async def admin_texts(request: Request, flash: str = "", warn: str = "",
+                          lang: str = "bn", q: str = ""):
+        """📝 বটের মেসেজ — change any message the bot sends, from the website."""
+        blocked = _guard(request)
+        if blocked:
+            return blocked
+        lang = lang if lang in ("bn", "en") else "bn"
+        needle = q.strip().lower()
+        note = f'<div class="flash">{esc(flash)}</div>' if flash else ""
+        warnbox = f'<div class="warnbox">{esc(warn)}</div>' if warn else ""
+        blocks = []
+        edited_total = 0
+        for group in bot_texts.catalog(lang):
+            cards = []
+            for row in group["rows"]:
+                if needle and needle not in row["key"].lower() \
+                        and needle not in row["label"].lower():
+                    continue
+                if row["edited"]:
+                    edited_total += 1
+                badge = ('<span class="badge">✏️ এডিট করা</span>' if row["edited"]
+                         else '<span class="badge">ডিফল্ট</span>')
+                default = esc(row["default"]) or '<span class="muted">(খালি)</span>'
+                value = esc(row["value"])
+                cards.append(f"""
+                <div class="card" style="margin-bottom:12px">
+                  <b>{esc(row['label'])}</b> {badge}
+                  <p class="muted">কী: <code>{esc(row['key'])}</code></p>
+                  <p class="muted">এখন যা যায়:</p>
+                  <pre style="white-space:pre-wrap">{esc(row['value'] or row['default'])}</pre>
+                  <form method=post action="/admin/texts/save">
+                    <input type="hidden" name="key" value="{esc(row['key'])}">
+                    <input type="hidden" name="lang" value="{lang}">
+                    <textarea name="value" rows="4" placeholder="নতুন লেখা… (খালি রাখলে ডিফল্ট ফিরে আসবে)">{value}</textarea>
+                    <p class="muted">ডিফল্ট: {default}</p>
+                    <div class="row">
+                      <button class="ok" type="submit">💾 সেভ</button>
+                      <button class="grey" type="submit" name="value" value="-">♻️ ডিফল্ট ফিরিয়ে দিন</button>
+                    </div>
+                  </form>
+                </div>""")
+            if cards:
+                blocks.append(f"<h3>{esc(group['group'])}</h3>" + "".join(cards))
+        body = f"""
+        {note}{warnbox}
+        <h3>📝 বটের মেসেজ</h3>
+        <p class="muted">বট ইউজারকে যা যা লেখে, সব এখান থেকে বদলানো যায় — কোড এডিট বা
+        রিস্টার্ট লাগে না। <code>{{store}}</code>, <code>{{n}}</code> এর মতো
+        প্লেসহোল্ডার আগের মতোই কাজ করবে। খালি রেখে সেভ করলে (বা ♻️ চাপলে) ডিফল্ট
+        লেখা ফিরে আসে।</p>
+        <p class="row">
+          <a class="btn {'ok' if lang == 'bn' else 'grey'}" href="/admin/texts?lang=bn">🇧🇩 বাংলা</a>
+          <a class="btn {'ok' if lang == 'en' else 'grey'}" href="/admin/texts?lang=en">🇬🇧 English</a>
+          <a class="btn grey" href="/admin/settings">🛠 সেটিংস</a>
+        </p>
+        <form method=get action="/admin/texts" class="row">
+          <input type="hidden" name="lang" value="{lang}">
+          <input name="q" value="{esc(q)}" placeholder="🔍 মেসেজ খুঁজুন (কী বা নাম)">
+          <button class="btn grey" type="submit">খুঁজুন</button>
+        </form>
+        <p class="muted">{edited_total} টি মেসেজ এখন নিজের লেখায় চলছে।</p>
+        {''.join(blocks) or '<p class="muted">কিছু পাওয়া গেল না।</p>'}
+        """
+        return layout("Bot texts", body, "/admin/texts")
+
+    @app.post("/admin/texts/save")
+    async def admin_texts_save(request: Request):
+        blocked = _guard(request)
+        if blocked:
+            return blocked
+        form = await request.form()
+        key = str(form.get("key", "")).strip()
+        lang = str(form.get("lang", "bn")).strip() or "bn"
+        value = str(form.get("value", ""))
+        ok, error = bot_texts.set(key, value, lang)
+        if not ok:
+            return RedirectResponse(f"/admin/texts?lang={lang}&warn={esc(error)}",
+                                    status_code=303)
+        label = "♻️ ডিফল্ট ফিরে এসেছে" if value.strip() in ("", "-") else "✅ সেভ হয়েছে"
+        return RedirectResponse(f"/admin/texts?lang={lang}&flash={esc(label)}",
+                                status_code=303)
+
     @app.get("/admin/stores/{store_id}", response_class=HTMLResponse)
     async def admin_store_detail(request: Request, store_id: int, flash: str = "", warn: str = ""):
         blocked = _guard(request)
@@ -1441,6 +1627,63 @@ def create_app() -> FastAPI:
             status_code=303)
 
     # ==================================================== tools: test / logs (v3)
+    @app.get("/admin/security", response_class=HTMLResponse)
+    async def admin_security(request: Request, flash: str = ""):
+        """🔐 টোকেন/সিক্রেট কোথাও পাবলিকভাবে পড়া যায় কি না — আর ঠিক করার ধাপে ধাপে।"""
+        blocked = _guard(request)
+        if blocked:
+            return blocked
+        report = secrets_guard.audit()
+        note = f'<div class="flash">{esc(flash)}</div>' if flash else ""
+        files = report.get("repo_files") or []
+        rows = "".join(
+            f"<tr><td><code>{esc(item['file'])}</code></td><td>{item['line']}</td>"
+            f"<td><code>{esc(item['preview'])}</code></td>"
+            f"<td>{'🚨 গত কমিটেও আছে' if item.get('committed') else '⚠️ ফাইলে আছে'}</td></tr>"
+            for item in files)
+        env_names = ", ".join(report.get("secrets") or []) or "— কিছু নেই —"
+        private_names = ", ".join(report.get("private") or []) or "— কিছু নেই —"
+        env_keys = ", ".join(report.get("in_environment") or []) or "— কিছু নেই —"
+        clean = not files and not report.get("tracked")
+        box = ('<div class="flash">✅ দারুণ — রিপোতে সরাসরি কোনো টোকেন/সিক্রেট পাওয়া যায়নি, '
+               'আর config.env কমিটও হয় না।</div>' if clean else
+               '<div class="warnbox">🚨 নিচের বিষয়গুলো এখনই ঠিক করা দরকার।</div>')
+        history = ("⚠️ হ্যাঁ — পুরোনো কমিটে config.env-এর মান এখনো পড়া যায়"
+                   if report.get("in_history") else "না")
+        body = f"""
+        {note}{box}
+        <h3>🔐 নিরাপত্তা (টোকেন ও সিক্রেট)</h3>
+        <p class="muted">রিপো পাবলিক (GitHub) — তাই <code>config.env</code> কখনো কমিট করা যায় না।
+        টোকেন শুধু হোস্টিং প্যানেলের <b>Environment Variables</b> বা ডিস্কের
+        <code>config.env</code>-এ থাকবে (ফাইলটি <code>.gitignore</code>-এ আছে)।</p>
+        <div class="grid">
+          {card("config.env কমিট হয়েছে?", "🚨 হ্যাঁ" if report.get("tracked") else "✅ না")}
+          {card("গিট ইতিহাসে পড়া যায়?", history)}
+          {card("env-এ থাকা গোপন মান", esc(env_names))}
+          {card("সার্ভারে সেট করা env", esc(env_keys))}
+        </div>
+        <p class="muted">ব্যক্তিগত (কম গোপন, তবু পাবলিক না করা ভালো): {esc(private_names)}</p>
+        <h4>🚨 রিপোর ফাইলে সরাসরি লেখা সিক্রেট</h4>
+        {f'<table><tr><th>ফাইল</th><th>লাইন</th><th>মান (লুকানো)</th><th>অবস্থা</th></tr>'
+          f'{rows}</table>' if files else '<p class="muted">কিছু পাওয়া যায়নি।</p>'}
+        <h4>✅ ঠিক করার ধাপ</h4>
+        <ol>
+          <li>BotFather → <code>/mybots</code> → আপনার বট → API Token → <b>Revoke</b>,
+              তারপর নতুন টোকেন কপি করুন।</li>
+          <li>পুরোনো টোকেন/হ্যাশ রিপো থেকে <b>মুছে ফেলুন</b> (উপরের তালিকার ফাইল), সেভ করে কমিট করুন।</li>
+          <li>Telegram → Settings → Devices → অচেনা সেশন <b>Terminate</b>।</li>
+          <li>নতুন টোকেন হোস্টিং প্যানেল → Environment Variables-এ বসান
+              (<code>BOT_TOKEN</code>, <code>API_HASH</code>, <code>API_ID</code>),
+              ডিস্কের <code>config.env</code>-এও রাখতে পারেন — কিন্তু কমিট করবেন না।</li>
+          <li>রিস্টার্ট দিন — বট নতুন টোকেন নিয়েই চলবে।</li>
+        </ol>
+        <p class="row">
+          <a class="btn grey" href="/admin/security">🔄 আবার পরীক্ষা করুন</a>
+          <a class="btn grey" href="/admin/self-test">🩺 Health</a>
+        </p>
+        """
+        return layout("Security", body, "/admin/security")
+
     @app.get("/admin/self-test", response_class=HTMLResponse)
     async def admin_self_test(request: Request, flash: str = ""):
         blocked = _guard(request)

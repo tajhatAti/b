@@ -409,25 +409,30 @@ def gate_keyboard(user_id: int, file_id: int, missing: list[dict], token: str = 
         label = f"📢 {target.get('title') or target.get('ref')}"
         if url:
             rows.append([Button.url(label[:60], url)])
+    from app.services import bot_texts
     payload = f"fj:{user_id}:{file_id}" + (f":{token}" if token else "")
-    rows.append([Button.inline("✅ আমি জয়েন করেছি", payload.encode())])
+    rows.append([Button.inline(bot_texts.render("join_button"), payload.encode())])
     return rows
 
 
-def gate_text(missing: list[dict], variant: str = "fresh") -> str:
+def gate_text(missing: list[dict], variant: str = "fresh") -> str:      # noqa: D401
     """HTML for the gate message. Channel titles come from Telegram, so they are
     escaped here — and the caller must therefore NOT escape the whole string."""
     from app.utils import esc
     channels = "\n".join(f"  • {esc(t.get('title') or t.get('ref') or '')}"
                          for t in missing[:6])
-    extra = esc(note()) if note() else ""
+    from app.services import bot_texts
+    extra = esc(note() or bot_texts.render("gate_note")) if (note() or bot_texts.render("gate_note")) else ""
     tail = f"\n\n<i>{extra}</i>" if extra else ""
-    if variant == "again":
-        return ("⛔️ এখনো জয়েন করেননি!\n\n"
-                f"নিচের চ্যানেল{'গুলো' if len(missing) > 1 else ''} জয়েন করে আবার "
-                "“আমি জয়েন করেছি” চাপুন:\n" + channels + tail)
-    return ("🔐 <b>ফাইলটি পেতে আগে চ্যানেল জয়েন করুন</b>\n\n"
-            "একবার জয়েন করলেই সব ভিডিও/ফাইল পাবেন:\n" + channels + tail)
+    from app.services import bot_texts
+    key = "gate_again" if variant == "again" else "gate_title"
+    body = bot_texts.render(key, channels=channels)
+    if not body:
+        body = ("⛔️ এখনো জয়েন করেননি!\n\nনিচের চ্যানেল জয়েন করে আবার "
+                "“আমি জয়েন করেছি” চাপুন:\n" + channels) if variant == "again" else \
+               ("🔐 <b>ফাইলটি পেতে আগে চ্যানেল জয়েন করুন</b>\n\n"
+                "একবার জয়েন করলেই সব ভিডিও/ফাইল পাবেন:\n" + channels)
+    return body + tail
 
 
 def clear_cache() -> None:

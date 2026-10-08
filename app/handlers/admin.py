@@ -158,7 +158,8 @@ async def admin_action(event, action: str) -> None:
 
     elif action == "settings":
         from app.services import settings as settings_service
-        rows = [[Button.inline("⚙️ সব সেটিংস (এখানেই বদলান)", "adm:setmenu")]]
+        rows = [[Button.inline("⚙️ সব সেটিংস (এখানেই বদলান)", "adm:setmenu")],
+                [Button.inline("📝 বটের মেসেজ এডিট", "tx:home")]]
         rows += keyboards.admin_settings_menu(runtime.is_online(admin_id))
         await ui.render(
             event,

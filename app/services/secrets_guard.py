@@ -14,6 +14,7 @@ admins on Telegram.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -23,6 +24,102 @@ from app.logger import log
 #: values that must never end up in a public repository
 SECRET_KEYS = ("BOT_TOKEN", "API_HASH", "STRING_SESSION", "WEB_PASS", "WEB_SECRET")
 PRIVATE_KEYS = ("API_ID", "ADMIN_IDS", "PAY_BKASH", "PAY_NAGAD", "PAY_ROCKET")
+
+# A secret does not have to be in config.env to leak: `website.example.py`, a
+# notebook, an “old copy” of the bot — any *tracked* file counts. These patterns
+# find the shapes Telegram uses, file by file (`git grep`, so it is instant even
+# on a big repo).
+#: POSIX ERE (git grep -E) — no `(?:…)`, no lookahead; the last group is the value
+PATTERNS = (
+    # a literal assignment: API_HASH = "…", BOT_TOKEN: "…", STRING_SESSION = '…'
+    r'(API_HASH|BOT_TOKEN|STRING_SESSION|WEB_SECRET)[ \t]*[:=][ \t]*["\']([^"\']{20,})["\']',
+    # a bot token anywhere: 1234567890:AAE…
+    r"([0-9]{8,10}:[A-Za-z0-9_-]{30,})",
+)
+#: never a real secret — the docs and this file itself talk *about* the patterns
+SKIP_FILES = ("config.env.example", ".env.example",
+              "app/services/secrets_guard.py", "README.md", "DEPLOY.md", "ENV.md",
+              "FEATURES.md", "PLAN.md")
+#: words that mean “this is a placeholder, not a credential”
+PLACEHOLDER_HINTS = ("your", "example", "placeholder", "change", "xxxx", "todo",
+                     "<", "…", "here", "abcd1234", "dummy")
+
+
+def _mask(text: str) -> str:
+    """Never echo a secret in full — just enough to recognise it."""
+    raw = text.strip()
+    if len(raw) <= 12:
+        return "…"
+    return f"{raw[:6]}…{raw[-4:]} ({len(raw)} chars)"
+
+
+def looks_real(value: str) -> bool:
+    """Enough signal that this is a credential and not a template value."""
+    raw = (value or "").strip()
+    if len(raw) < 20:
+        return False
+    low = raw.lower()
+    if any(hint in low for hint in PLACEHOLDER_HINTS):
+        return False
+    if re.fullmatch(r"[0-9a-fA-F]{32}", raw):          # API_HASH shape
+        return True
+    if re.fullmatch(r"\d{8,10}:[A-Za-z0-9_-]{30,}", raw):    # bot token shape
+        return True
+    # long single-token value (STRING_SESSION, WEB_SECRET) — no spaces, some digits
+    return bool(re.fullmatch(r"[A-Za-z0-9_\-+/=:.]{24,}", raw)) and any(ch.isdigit() for ch in raw)
+
+
+def _skip(path: str) -> bool:
+    return Path(path).name in SKIP_FILES or path.startswith(("docs/", "tests/"))
+
+
+def scan_repo(repo_dir: Path | None = None, limit: int = 25) -> list[dict]:
+    """Every *tracked* file that looks like it holds a real credential.
+
+    Returns [{"file", "line", "preview"}] — preview is masked, so the report can
+    be shown in the panel or in a Telegram message without leaking anything new.
+    """
+    repo = Path(repo_dir or Path(cfg.BASE_DIR))
+    findings: list[dict] = []
+    seen: dict[tuple[str, int], int] = {}          # (file, line) → index in findings
+    # Two places count: what is on disk *and* what the last commit holds. A file
+    # deleted a minute ago is still readable by everyone until it is committed away.
+    for where in (".", "HEAD"):
+        for pattern in PATTERNS:
+            try:
+                result = subprocess.run(  # noqa: S603 - fixed argv, no shell
+                    ["git", "-C", str(repo), "grep", "-nIE", pattern, where],
+                    capture_output=True, timeout=20, check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                return findings
+            if result.returncode not in (0, 1):    # 1 = simply “no match”
+                continue
+            for line in result.stdout.decode("utf-8", errors="ignore").splitlines():
+                if where != "." and line.startswith(f"{where}:"):
+                    line = line[len(where) + 1:]        # `git grep HEAD` prefixes it
+                path, _, rest = line.partition(":")
+                number, _, content = rest.partition(":")
+                if not number.isdigit() or _skip(path):
+                    continue
+                found = re.search(pattern, content)
+                # the *last* group is always the credential itself
+                value = (found.group(found.lastindex) if found and found.lastindex
+                         else (found.group(0) if found else ""))
+                if not looks_real(value):
+                    continue
+                key = (path, int(number))
+                if key in seen:
+                    if where == "HEAD":
+                        findings[seen[key]]["committed"] = True
+                    continue
+                if len(findings) >= limit:
+                    continue
+                seen[key] = len(findings)
+                findings.append({"file": path, "line": int(number),
+                                 "preview": _mask(value),
+                                 "committed": where == "HEAD"})
+    return findings
 
 
 def _git_tracked(repo_dir: Path, name: str) -> bool | None:
@@ -82,6 +179,9 @@ def audit(repo_dir: Path | None = None, env_file: Path | None = None) -> dict:
     values = _env_file_values(env_file)
     present = {key for key, value in values.items() if value and value.lower() not in
                ("your_token_here", "change_me")}
+    env_name = env_file.name
+    repo_files = [row for row in scan_repo(repo_dir) if Path(row["file"]).name != env_name] \
+        if tracked is not None else []
     return {
         "tracked": bool(tracked),
         "git_available": tracked is not None,
@@ -90,6 +190,7 @@ def audit(repo_dir: Path | None = None, env_file: Path | None = None) -> dict:
         "private": sorted(present & set(PRIVATE_KEYS)),
         "in_environment": sorted(key for key in SECRET_KEYS if os.getenv(key)),
         "in_history": in_history,
+        "repo_files": repo_files,
     }
 
 
@@ -108,6 +209,21 @@ def warning_lines(report: dict) -> list[str]:
             "   ✅ ফাইলটি এখন আর কমিট হয় না — কিন্তু পুরোনো কমিটে মানটা এখনো পড়া যায়।",
             "   ✅ তাই একবার অবশ্যই করুন: BotFather → /mybots → API Token → Revoke,",
             "      নতুন টোকেন config.env-এ বসান; Telegram → Devices → অচেনা সেশন Terminate।",
+            "   বিস্তারিত: README.md → 💾 ডেটা, ব্যাকআপ ও নিরাপত্তা",
+        ]
+    files = report.get("repo_files") or []
+    if files:
+        listed = "\n".join(f"   • <code>{f['file']}</code>: line {f['line']} — "
+                           f"{f['preview']}" for f in files[:5])
+        more = f"\n   … আরও {len(files) - 5} টি" if len(files) > 5 else ""
+        return [
+            "🚨 রিপোর ভেতরে সরাসরি লেখা গোপন তথ্য পাওয়া গেছে "
+            f"({len(files)} জায়গায়) — রিপো পাবলিক হলে সবাই দেখছে:",
+            listed + more,
+            "   ✅ যা করবেন: মানগুলো মুছে ফেলুন, শুধু <code>config.env</code> বা হোস্টিং "
+            "প্যানেলের Environment Variables-এ রাখুন;",
+            "   ✅ BotFather → /mybots → API Token → Revoke (একবার টোকেন ফাঁস হলে "
+            "নতুন টোকেন নেওয়াই নিরাপদ);",
             "   বিস্তারিত: README.md → 💾 ডেটা, ব্যাকআপ ও নিরাপত্তা",
         ]
     if not report.get("secrets") or not report.get("tracked"):

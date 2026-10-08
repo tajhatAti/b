@@ -84,8 +84,9 @@ def is_plain_text(message) -> bool:
 
 
 def reject_text(reason: str) -> str:
+    from app.services import bot_texts
     if reason in ("text", "empty"):
-        return REJECT_TEXT
+        return bot_texts.render("media_only")
     label = {"sticker": "স্টিকার / GIF", "audio": "অডিও / ভয়েস",
              "document": "ডকুমেন্ট / ফাইল", "file": "ফাইল",
              "other": "এই ধরনের কনটেন্ট"}.get(reason, "এই কনটেন্ট")

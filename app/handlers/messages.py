@@ -103,6 +103,10 @@ async def media_upload(event) -> None:
     kind, reason = media_guard.classify(event.message)
     if kind is None and not _has_admin_flow(admin_id):
         if access.is_admin(admin_id):
+            # A question is open (or files are simply expected): the owner wanted an
+            # alert when someone is “stuck” here, including himself on another device.
+            if reason not in ("text",) or pending_cover_open(admin_id):
+                spawn(_alert_stuck_upload(event, reason))
             await _text_guard_reply(event, reason)
         return
 
@@ -217,6 +221,12 @@ async def media_upload(event) -> None:
     )
 
 
+def pending_cover_open(admin_id: int) -> bool:
+    """True while the bot is waiting for *media* from this admin."""
+    row = peek(admin_id)
+    return bool(row) and row.get("action") in ("store_cover", "upload_media")
+
+
 def _has_admin_flow(admin_id: int) -> bool:
     pending = peek(admin_id)
     return bool(pending) and pending.get("action") in ("store_cover", "payment_proof")
@@ -229,6 +239,24 @@ def _is_add_channel_forward(admin_id: int) -> bool:
 
 
 _last_text_nudge: dict[int, float] = {}
+
+
+async def _alert_stuck_upload(event, reason: str) -> None:
+    """Tell the owner when files were expected but something else arrived.
+
+    Rate-limited per user inside `alerts`, so a chatty user cannot spam the owner.
+    """
+    try:
+        from app.services import alerts
+        sender = await event.get_sender()
+        name = getattr(sender, "first_name", "") or ""
+        labels = {"text": "টেক্সট / লিংক", "sticker": "স্টিকার বা GIF",
+                  "audio": "অডিও / ভয়েস", "document": "ডকুমেন্ট",
+                  "file": "ফাইল", "empty": "খালি মেসেজ", "other": "অন্য কিছু"}
+        spawn(alerts.stuck_upload(event.sender_id,
+                                  labels.get(reason, reason or "অন্য কিছু"), name))
+    except Exception as exc:
+        log.debug("stuck-upload alert skipped: %s", exc)
 
 
 async def _text_guard_reply(event, reason: str) -> None:
@@ -999,6 +1027,28 @@ async def pending_input(event) -> None:
         try:
             from app.handlers.admin import send_panel
             await send_panel(event, edit=False)
+        except Exception:
+            pass
+        return
+
+    # ------------------------------------------------------- bot texts (v3)
+    if action == "text_edit":
+        from app.services import bot_texts
+        key = ctx.get("key") or ""
+        lang = ctx.get("lang") or "bn"
+        raw = (event.raw_text or "").strip()
+        ok, error = bot_texts.set(key, "" if raw in ("", "-") else raw, lang)
+        if not ok:
+            await ask_again(event, action, f"⚠️ {esc(error)}", **ctx)
+            return
+        if raw and raw != "-":
+            await event.respond("✅ সেভ হয়েছে — এখন থেকে বট এভাবে বলবে:\n\n"
+                                f"<blockquote>{esc(raw)}</blockquote>")
+        else:
+            await event.respond("♻️ ডিফল্ট লেখা ফিরে এসেছে।")
+        try:
+            from app.handlers import panel_v3
+            await panel_v3.texts_one(event, key)
         except Exception:
             pass
         return

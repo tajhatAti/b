@@ -136,11 +136,19 @@ def lang_of(user_id: int) -> str:
 
 
 def t(user_id: int, key: str, **kwargs) -> str:
-    """Translate `key` for the given user."""
-    entry = STRINGS.get(key)
+    """Translate `key` for the given user.
+
+    The owner can rewrite any of these from the panel (⚙️ → 📝 বটের মেসেজ); the
+    override is checked first, the built-in wording stays as the fallback.
+    """
+    from app.services import bot_texts
+    lang = lang_of(user_id)
+    entry = STRINGS.get(key) or ADMIN_STRINGS.get(key)
     if entry is None:
-        return key
-    text = entry.get(lang_of(user_id)) or entry.get("bn") or key
+        own = bot_texts.override(key, lang) or bot_texts.override(key, "bn")
+        return own.format(**kwargs) if (own and kwargs) else (own or key)
+    own = bot_texts.override(key, lang)
+    text = own or entry.get(lang) or entry.get("bn") or key
     if kwargs:
         try:
             return text.format(**kwargs)

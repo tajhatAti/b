@@ -33,6 +33,7 @@ SCREENS = [
     "supc:back", "sb:1", "dr:1", "gst:1", "gbulk:1", "nbcgo:", "sfj:1",
     "rq:1", "up:0", "cu:0", "ast:1", "rqd:1", "shr:1", "scp:1", "gd:1",
     "lg:1", "lgp:1", "lgt:1", "plan:1", "adm:setk:BROADCAST_DELAY",
+    "tx:home", "tx:g:0", "tx:k:home_banner",
 ]
 
 
