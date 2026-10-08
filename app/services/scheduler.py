@@ -3,6 +3,7 @@ reminders and a session watchdog."""
 from __future__ import annotations
 
 import asyncio
+import time
 
 from app import config as cfg
 from app.logger import log
@@ -219,6 +220,64 @@ async def mirror_loop() -> None:
         await asyncio.sleep(120)
 
 
+async def digest_loop() -> None:
+    """Weekly “new this week” broadcast — the helpful nudge that sells content.
+
+    Runs only when the owner switches it on in the panel. For every store that got
+    new files in the last 7 days it queues one campaign to that store's audience
+    (free stores: everyone; paid stores: buyers + drip subscribers).
+    """
+    while True:
+        try:
+            if settings.get_bool("DIGEST_ENABLED", False):
+                now = local_time_str()
+                weekday = int(time.strftime("%w", time.localtime()))
+                hour = int(now[:2])
+                wanted_day = settings.get_int("DIGEST_WEEKDAY", 4)
+                wanted_hour = settings.get_int("DIGEST_HOUR", 10)
+                today = local_date_str()
+                if weekday == wanted_day % 7 and hour == wanted_hour \
+                        and db.get_meta("digest_last") != today:
+                    db.set_meta("digest_last", today)
+                    await run_digest()
+        except Exception as exc:
+            log.error("digest loop error: %s", exc)
+        await asyncio.sleep(600)
+
+
+async def run_digest(force: bool = False) -> dict:
+    """Queue the weekly digest campaigns. Returns a small report."""
+    from app import runtime
+    from app.services import broadcast
+
+    week_ago = time.time() - 7 * 86400
+    max_files = max(1, settings.get_int("DIGEST_MAX_FILES", 2))
+    queued = []
+    for store in db.all_stores():
+        fresh = [f for f in db.files_of(store["id"], newest_first=True)
+                 if (f.get("created_at") or 0) >= week_ago][:max_files]
+        if not fresh:
+            continue
+        audience = f"store:{store['id']}"
+        targets = broadcast.resolve_audience(store["admin_id"], audience)
+        if not targets:
+            continue
+        title = f"সাপ্তাহিক ডাইজেস্ট — {store['name']}"
+        text = (f"🆕 <b>এই সপ্তাহের নতুন ভিডিও</b>\n🏪 <b>{store['name']}</b>\n\n"
+                f"{len(fresh)} টি নতুন কনটেন্ট যোগ হয়েছে — নিচের বাটনে চাপ দিন।")
+        campaign = broadcast.create_campaign(
+            store["admin_id"], title=title, text=text, audience=audience,
+            files=[f["id"] for f in fresh], start=True)
+        queued.append({"store": store["name"], "campaign": campaign["id"],
+                       "targets": len(targets), "files": len(fresh)})
+        log.info("Digest queued for store %s → %s users", store["id"], len(targets))
+    if queued and runtime.bot_online():
+        for item in queued:
+            if not broadcast.is_running(item["campaign"]):
+                broadcast.start_campaign(item["campaign"])
+    return {"ok": True, "queued": queued}
+
+
 def start_all() -> list[asyncio.Task]:
     from app.runtime import spawn
     tasks = [
@@ -229,6 +288,7 @@ def start_all() -> list[asyncio.Task]:
         spawn(session_watchdog()),
         spawn(campaign_loop()),
         spawn(mirror_loop()),
+        spawn(digest_loop()),
     ]
     log.info("Started %s background workers", len(tasks))
     return tasks

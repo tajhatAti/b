@@ -189,7 +189,7 @@ def user_detail_body(user_id: int) -> str:
     tickets = db.tickets(status=None, user_id=user_id, limit=20)
 
     grant_rows = "".join(
-        f"<tr><td>{esc(g['store_name'])}</td><td>{_start(g['created_at'])}</td>"
+        f"<tr><td>{esc(g['store_name'])}</td><td>{_start(g.get('granted_at'))}</td>"
         f"<td>{'♾ লাইফটাইম' if g['expires_at'] is None else _start(g['expires_at'])}</td>"
         f"<td>{esc(g.get('source') or '')}</td></tr>" for g in grants)
     order_rows = "".join(
@@ -407,7 +407,7 @@ def store_admin_body(store: dict, flash: str = "", warn: str = "") -> str:
     grants = db.store_grants(store["id"])
     grant_rows = "".join(
         f"<tr><td>{_user_link(g['user_id'], g.get('user_name'))}</td>"
-        f"<td>{_start(g['created_at'])}</td>"
+        f"<td>{_start(g.get('granted_at') or g.get('created_at'))}</td>"
         f"<td>{'♾' if g['expires_at'] is None else _start(g['expires_at'])}</td>"
         f"<td>{esc(g.get('source') or '')}</td></tr>" for g in grants[:100])
     note = f'<div class="flash">{esc(flash)}</div>' if flash else ""
@@ -438,6 +438,97 @@ def store_admin_body(store: dict, flash: str = "", warn: str = "") -> str:
     <h4>👥 অ্যাক্সেস দেওয়া ইউজার</h4>
     <table><tr><th>ইউজার</th><th>দেওয়া</th><th>শেষ</th><th>সোর্স</th></tr>
     {grant_rows or "<tr><td colspan=4 class='muted'>—</td></tr>"}</table>"""
+
+
+# ------------------------------------------------------------- self test / logs
+async def self_test() -> list[dict]:
+    """One click → is everything actually working? (the owner's “কেন কাজ করছে না?”)"""
+    from app import config as cfg
+    from app.services import broadcast, media_cache
+    from app.services.telegram import flood_status
+
+    checks: list[dict] = []
+
+    def add(name: str, ok: bool | None, detail: str = "") -> None:
+        checks.append({"name": name, "ok": ok, "detail": detail})
+
+    stats = db.stats()
+    add("ডেটাবেজ", True, f"{stats['users']} ইউজার · {stats['files']} ফাইল · {stats['stores']} স্টোর")
+    add("বট", runtime.bot_online(), f"@{runtime.bot_username}" if runtime.bot_username else "ইউজারনেম নেই")
+    sessions = db.all_sessions()
+    online = sum(1 for row in sessions if row["admin_id"] in runtime.user_clients)
+    add("ইউজারবট সেশন", online > 0 or not sessions,
+        f"{online}/{len(sessions)} কানেক্টেড" if sessions else "কোনো সেশন নেই (উpload করা ফাইল 직접 পাঠানো যাবে)")
+
+    cache = media_cache.stats()
+    add("মিডিয়া ক্যাশ", cache["missing"] == 0,
+        f"{cache['mirrored']}/{cache['files']} ফাইল সরাসরি বট থেকে যাবে"
+        + (f" · {cache['missing']} টি বাকি" if cache["missing"] else ""))
+
+    for target in forcejoin.targets():
+        info = await forcejoin.ensure_target(target)
+        add(f"চ্যানেল: {target.get('title') or target.get('ref')}", bool(info.get("ok")),
+            f"id {info.get('chat_id')}" if info.get("ok") else str(info.get("error") or "")[:90])
+
+    running = [c for c in db.campaigns(limit=20) if c["status"] in broadcast.ACTIVE_STATUSES]
+    add("ব্রডকাস্ট কিউ", True, f"{len(running)} চলমান · মোট {len(db.campaigns(limit=200))} ক্যাম্পেইন")
+    add("ফোর্স-জয়েন", True,
+        f"{len(forcejoin.targets())} চ্যানেল সেট" if forcejoin.targets() else "বন্ধ (কেউ আটকাবে না)")
+    add("টেলিগ্রামের চাপ", not bool(flood_status()), flood_status() or "স্বাভাবিক")
+    add("ওয়েব লগইন", bool(cfg.WEB_PASS), "WEB_PASS সেট আছে" if cfg.WEB_PASS else "পাসওয়ার্ড নেই (হোস্টে সেট করুন)")
+    return checks
+
+
+def self_test_body(checks: list[dict]) -> str:
+    rows = "".join(
+        f"<tr><td>{'✅' if c['ok'] else ('⚠️' if c['ok'] is None else '❌')}</td>"
+        f"<td>{esc(c['name'])}</td><td class='muted'>{esc(c['detail'])}</td></tr>"
+        for c in checks)
+    bad = [c for c in checks if c["ok"] is False]
+    head = ("<div class='flash'>সব ঠিক আছে ✅</div>" if not bad else
+            f"<div class='warnbox'>⚠️ {len(bad)} টি জিনিস দেখতে হবে — নিচে লাল ❌ দেখুন</div>")
+    return f"""{head}
+    <h3>🩺 সেলফ-টেস্ট</h3>
+    <table><tr><th></th><th>কী</th><th>অবস্থা</th></tr>{rows}</table>
+    <p class="row">
+      <a class="btn" href="/admin/self-test">🔄 আবার চালান</a>
+      <a class="btn grey" href="/admin/cache/warm">📥 সব ফাইল ক্যাশ করুন</a>
+      <a class="btn grey" href="/admin/logs">📜 লাইভ লগ</a>
+    </p>"""
+
+
+def logs_body(lines: list[str], level: str = "") -> str:
+    joined = "".join(f"<div class='logline'>{esc(line)}</div>" for line in lines)
+    return f"""<h3>📜 লাইভ লগ <span class="muted">(সর্বশেষ {len(lines)} লাইন)</span></h3>
+    <p class="row">
+      <a class="btn grey" href="/admin/logs">সব</a>
+      <a class="btn grey" href="/admin/logs?level=ERROR">শুধু ERROR</a>
+      <a class="btn grey" href="/admin/logs?level=WARNING">WARNING</a>
+      <a class="btn grey" href="/admin/logs?level=INFO">INFO</a>
+      <a class="btn" href="/admin/logs">🔄 রিফ্রেশ</a>
+    </p>
+    <div class="card" style="max-height:70vh;overflow:auto;font-family:ui-monospace,monospace;
+         font-size:12.5px;line-height:1.5">{joined or '<span class="muted">লগ খালি</span>'}</div>"""
+
+
+def files_tools_body() -> str:
+    dups = db.duplicate_files()
+    dup_rows = "".join(
+        f"<tr><td>{esc(str(d['name']))}</td><td>{esc(str(d['store_id']))}</td>"
+        f"<td>{d['c']}</td></tr>" for d in dups[:50])
+    cache = db.count_files(), db.count_mirrors()
+    return f"""<div class="card">
+      <h4>🧹 টুল</h4>
+      <p class="muted">ক্যাশ করা ফাইল বট নিজেই পাঠায় — তাই ক্লিক আর ব্রডকাস্ট দুটোই দ্রুত ও
+         নিরাপদ (কোনো forward/delete নেই)।</p>
+      <p class="row">
+        <a class="btn" href="/admin/cache/warm">📥 সব ফাইল ক্যাশ করুন</a>
+        <span class="pill">ক্যাশড {cache[1]}/{cache[0]}</span>
+        <span class="pill">ডুপ্লিকেট {len(dups)}</span>
+        <a class="btn warn" href="/admin/files/dedupe">🧹 ডুপ্লিকেট পরিষ্কার</a>
+      </p>
+      {f'<table><tr><th>নাম</th><th>স্টোর</th><th>কপি</th></tr>{dup_rows}</table>' if dups else ''}
+    </div>"""
 
 
 def now_label() -> str:

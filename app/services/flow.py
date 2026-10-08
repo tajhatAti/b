@@ -150,10 +150,12 @@ async def open_link(event, token: str, *, chat_id: int | None = None) -> str:
         if take["reason"] == "limit":
             limit = int(take.get("limit") or 0)
             log("limit_block", user_id, None, None, token, f"limit={limit}")
-            await sender.send_text(chat, _limit_text(limit, int(take.get("clicks") or 0)))
+            await sender.send_text(chat, _limit_text(limit, int(take.get("clicks") or 0)),
+                                   buttons=contact_buttons())
             return GATE_LIMIT
         log("limit_block", user_id, None, None, token, take["reason"])
-        await sender.send_text(chat, "⛔️ <b>এই লিংকের সময় শেষ</b> — আর কাজ করবে না।")
+        await sender.send_text(chat, "⛔️ <b>এই লিংকের মেয়াদ শেষ</b> — আর কাজ করবে না।",
+                               buttons=contact_buttons())
         return GATE_LIMIT
 
     file_ids = db.link_file_ids(token)
@@ -191,6 +193,18 @@ async def open_link(event, token: str, *, chat_id: int | None = None) -> str:
     if limit and take.get("left") and take["left"] > 0:
         await sender.send_text(chat, f"ℹ️ <i>এই লিংকটি আর {take['left']} বার খোলা যাবে।</i>")
     return GATE_OK
+
+
+def contact_buttons() -> list[list]:
+    """A way out of a dead end: talk to the admin (contact set in the panel)."""
+    from telethon.tl.custom import Button
+    from app.services import settings
+    username = (settings.get_str("SUPPORT_CONTACT") or "").strip()
+    if username.startswith(("http://", "https://", "tg://")):
+        return [[Button.url("📞 অ্যাডমিনের সাথে যোগাযোগ", username)]]
+    if username.startswith("@"):
+        return [[Button.url("📞 অ্যাডমিনের সাথে যোগাযোগ", f"https://t.me/{username[1:]}")]]
+    return [[Button.inline("📞 অ্যাডমিনের সাথে কথা বলুন", b"ct:0")]]
 
 
 def _limit_text(limit: int, used: int) -> str:

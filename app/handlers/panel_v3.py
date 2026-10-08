@@ -227,10 +227,26 @@ async def analytics_home(event, rest: str) -> None:
                          f"(ইউনিক {uniq})")
             buttons.append([Button.inline(f"👥 {_short(row['name'], 22)}",
                                           f"an:file:{row['id']}")])
+    buttons.append([Button.inline("🆕 ডাইজেস্ট এখনই পাঠান", "dg:run")])
     buttons.append([Button.inline("🌐 ওয়েবে বিস্তারিত", "an:web"),
                     Button.inline("🔙 প্যানেল", "adm:back")])
     await _render(event, "\n".join(lines), buttons)
     await event.answer()
+
+
+@route("dg:run")
+async def digest_now(event, rest: str) -> None:
+    if not _is_admin(event):
+        return
+    from app.services.scheduler import run_digest
+    result = await run_digest(force=True)
+    queued = result.get("queued") or []
+    if not queued:
+        await event.answer("এই সপ্তাহে নতুন ফাইল নেই", alert=True)
+        return
+    total = sum(item["targets"] for item in queued)
+    await event.answer(f"✅ {len(queued)} টি স্টোরের ডাইজেস্ট কিউ হয়েছে ({total} ইউজার)",
+                       alert=True)
 
 
 @route("an:web")

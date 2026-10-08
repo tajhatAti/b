@@ -97,6 +97,43 @@ def main() -> int:
                                       audience="store:%d" % premium["id"], status="draft")
         print(f"  • demo campaign #{campaign}")
 
+    # ------------------------------------------------ v3 demo: analytics & links
+    # Per-user watch history, so the new analytics screens have something to show.
+    if not db.events(limit=1):
+        files = {row["id"]: row for row in db.newest_files(60)}
+        for index, uid in enumerate(users[:18]):
+            db.log_event("start", uid, None, None, "demo")
+            for store in list(stores.values())[: 1 + index % 3]:
+                store_files = db.files_of(store["id"])
+                if not store_files:
+                    continue
+                db.log_event("open_store", uid, store["id"], None, store["slug"])
+                for row in random.sample(store_files, min(2, len(store_files))):
+                    db.log_event("deliver", uid, store["id"], row["id"], "demo")
+                    db.bump_views(row["id"])
+            if index % 4 == 0:
+                db.log_event("join_block", uid, list(stores.values())[0]["id"], None, "demo")
+            if index % 5 == 0:
+                db.log_event("pay_start", uid, premium["id"], None, "plan:1")
+                db.log_event("paid", uid, premium["id"], None, "order:demo")
+        print("  • demo events logged")
+
+    # Limited link (100 clicks) + unlimited link, so /admin/links is not empty.
+    if not db.links(limit=1):
+        newest = db.files_of(premium["id"])[:2]
+        if newest:
+            token = db.create_link(admin_id, [row["id"] for row in newest], None,
+                                   kind="limited", max_clicks=100, note="ডেমো — ১০০ ক্লিক")
+            print(f"  • limited link: https://t.me/<bot>?start=t{token} (100 clicks)")
+
+    # A channel + a store-specific force channel for the demo panel.
+    if not db.join_channels():
+        db.add_join_channel(None, "@demo_channel", title="📢 ডেমো চ্যানেল", chat_id=-100_1111)
+        db.set_store_forcejoin(premium["id"], "@demo_store_channel")
+        db.add_join_channel(premium["id"], "@demo_store_channel",
+                            title="🎬 সিনেমা হাউস — আলাদা চ্যানেল", chat_id=-100_2222)
+        print("  • demo channels registered")
+
     print("Done. Open the website to see it.")
     return 0
 

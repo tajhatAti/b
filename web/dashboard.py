@@ -158,6 +158,8 @@ CSS = """
  .bar { background:#0b111b; border-radius:999px; height:12px; overflow:hidden; border:1px solid var(--line); }
  .bar > i { display:block; height:100%; background:linear-gradient(90deg,#22c55e,#2563eb); }
  footer { color:var(--mut); font-size:13px; text-align:center; padding:28px 16px; }
+ .logline { white-space:pre-wrap; word-break:break-word; border-bottom:1px solid #1a2334; padding:3px 2px; }
+ .logline:first-child { color:#e8eef7; }
 """
 
 
@@ -178,6 +180,7 @@ def layout(title: str, body: str, active: str = "", admin: bool = True) -> str:
         ("/admin/orders", "🧾 Orders"),
         ("/admin/download", "📥 Export"),
         ("/admin/settings", "🛠 Settings"),
+        ("/admin/self-test", "🩺 Health"),
     ]
     items = public_nav + admin_nav
     nav = "".join(
@@ -480,6 +483,11 @@ def create_app() -> FastAPI:
             ফ্রি {len(broadcast.resolve_audience(0, 'free'))} জন</p>
           </form>
         </div>
+        <p class="row">
+          <a class="btn grey" href="/admin/links">🔗 লিমিটেড লিংক বানান</a>
+          <a class="btn grey" href="/admin/channels/compose">📡 চ্যানেলে পোস্ট</a>
+          <a class="btn warn" href="/admin/digest">🆕 সাপ্তাহিক ডাইজেস্ট এখনই পাঠান</a>
+        </p>
         <h3>📜 ক্যাম্পেইন</h3>
         {_campaign_table(db.campaigns(limit=40))}
         """
@@ -708,6 +716,7 @@ def create_app() -> FastAPI:
                 f"<td><a class='btn' href='/admin/files/broadcast/{row['id']}'>📢</a> "
                 f"<a class='btn bad' href='/admin/files/delete/{row['id']}'>🗑</a></td></tr>")
         body = f"""{note}
+        {panels.files_tools_body()}
         <h3>🗂 ফাইল</h3>
         <form method=get><input name=q placeholder="সব স্টোরে সার্চ" value="{esc(q)}"></form>
         <table><tr><th>ID</th><th>Name</th><th>Store</th><th>Type</th><th>Views</th><th>Size</th><th></th></tr>
@@ -1307,6 +1316,72 @@ def create_app() -> FastAPI:
         else:
             note = "✅ এই স্টোরের আলাদা চ্যানেল বন্ধ করা হলো"
         return RedirectResponse(f"/admin/stores?flash={note}", status_code=303)
+
+    @app.get("/admin/digest")
+    async def admin_digest_run(request: Request):
+        """🧪 Switch the weekly digest on and send it right now (preview first)."""
+        blocked = _guard(request)
+        if blocked:
+            return blocked
+        from app.services.scheduler import run_digest
+        result = await run_digest(force=True)
+        queued = result.get("queued") or []
+        if not queued:
+            return RedirectResponse(
+                "/admin/broadcast?warn=এই+সপ্তাহে+নতুন+ফাইল+নেই+(বা+কেউ+নেই)",
+                status_code=303)
+        total = sum(item["targets"] for item in queued)
+        return RedirectResponse(
+            f"/admin/broadcast?flash=🆕+ডাইজেস্ট+কিউ+হয়েছে:+{len(queued)}+স্টোর,+{total}+ইউজার",
+            status_code=303)
+
+    # ==================================================== tools: test / logs (v3)
+    @app.get("/admin/self-test", response_class=HTMLResponse)
+    async def admin_self_test(request: Request, flash: str = ""):
+        blocked = _guard(request)
+        if blocked:
+            return blocked
+        checks = await panels.self_test()
+        note = f'<div class="flash">{esc(flash)}</div>' if flash else ""
+        return layout("Self test", note + panels.self_test_body(checks), "/admin/self-test")
+
+    @app.get("/admin/logs", response_class=HTMLResponse)
+    async def admin_logs(request: Request, level: str = "", lines: int = 300):
+        blocked = _guard(request)
+        if blocked:
+            return blocked
+        content: list[str] = []
+        try:
+            from pathlib import Path
+            path = Path(cfg.LOG_FILE)
+            if path.exists():
+                raw = path.read_text(errors="ignore").splitlines()[-max(50, min(lines, 2000)):]
+                if level:
+                    raw = [line for line in raw if level.upper() in line.upper()]
+                content = raw
+        except Exception as exc:
+            content = [f"লগ পড়া যায়নি: {exc}"]
+        return layout("Logs", panels.logs_body(content, level), "/admin/settings")
+
+    @app.get("/admin/cache/warm")
+    async def admin_cache_warm(request: Request, limit: int = 15):
+        blocked = _guard(request)
+        if blocked:
+            return blocked
+        from app.services.media_cache import warm_mirrors
+        result = await warm_mirrors(limit=limit)
+        return RedirectResponse(
+            f"/admin/self-test?flash=ক্যাশ:+{result['mirrored']}+হয়েছে,+{result['missing']}+বাকি",
+            status_code=303)
+
+    @app.get("/admin/files/dedupe")
+    async def admin_files_dedupe(request: Request):
+        blocked = _guard(request)
+        if blocked:
+            return blocked
+        removed = db.purge_duplicate_files()
+        return RedirectResponse(f"/admin/files?flash=🧹+{removed}+টি+ডুপ্লিকেট+মুছে+ফেলা+হলো",
+                                status_code=303)
 
     @app.get("/health")
     async def health() -> JSONResponse:
