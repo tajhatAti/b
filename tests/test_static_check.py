@@ -53,3 +53,37 @@ def test_no_undefined_names_anywhere_in_the_project(capsys):
     bad = check_paths(TARGETS)
     output = capsys.readouterr().out
     assert bad == 0, f"undefined names found:\n{output}"
+
+
+# ------------------------------------------------------------- secrets watchdog
+def _git(args, cwd):
+    import subprocess
+    return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, check=False)
+
+
+def test_secrets_guard_shouts_when_the_file_is_still_in_history(tmp_path):
+    """Removing config.env from the tree is not enough — the old commit still has
+    it, so the guard must keep telling the owner to revoke the token."""
+    from app.services import secrets_guard
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(["init", "-q"], repo)
+    _git(["config", "user.email", "t@example.com"], repo)
+    _git(["config", "user.name", "tester"], repo)
+    env_file = repo / "config.env"
+    env_file.write_text("BOT_TOKEN=123:AAdeadbeef\nAPI_ID=1\n", encoding="utf-8")
+    _git(["add", "-f", "config.env"], repo)
+    _git(["commit", "-qm", "oops, committed the token"], repo)
+
+    tracked = secrets_guard.audit(repo_dir=repo, env_file=env_file)
+    assert tracked["tracked"] is True and "BOT_TOKEN" in tracked["secrets"]
+    assert any("Revoke" in line for line in secrets_guard.warning_lines(tracked))
+
+    _git(["rm", "-q", "--cached", "config.env"], repo)
+    _git(["commit", "-qm", "remove it again"], repo)
+    after = secrets_guard.audit(repo_dir=repo, env_file=env_file)
+    assert after["tracked"] is False
+    assert after["in_history"] is True
+    lines = secrets_guard.warning_lines(after)
+    assert lines and "গিট ইতিহাসে" in lines[0] and "Revoke" in " ".join(lines)

@@ -28,6 +28,8 @@ python run.py
 
 1. **টোকেন রিভোক করে নতুন নিন** — BotFather → `/mybots` → API Token → Revoke.
    পুরোনো টোকেন কোডে/পাবলিকে চলে গেলে অবশ্যই নতুন নিন।
+   ⚠️ `config.env` **কখনো** রিপোতে কমিট করবেন না — একবার গেলে ফাইল মুসলেও পুরোনো
+   কমিটে মানটা থেকে যায়, তাই রিভোক করাই একমাত্র সমাধান (বট নিজেই সতর্কবার্তা দেবে)।
 2. CodeNest-এ নতুন bot/app বানান → **Own code / Upload** দিয়ে পুরো ফোল্ডার আপলোড করুন।
 3. **Start command**: `python run.py` (আগে `pip install -r requirements-web.txt` হবে)।
 4. Environment variables সেট করুন (নিচের টেবিল দেখুন) — অথবা `config.env` ফাইল আপলোড করুন।

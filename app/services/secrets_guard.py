@@ -40,6 +40,23 @@ def _git_tracked(repo_dir: Path, name: str) -> bool | None:
     return None if b"fatal" in result.stderr.lower() else False
 
 
+def _git_history_names(repo_dir: Path, name: str, limit: int = 200) -> bool:
+    """True when `name` appears in commit history — even after `git rm`.
+
+    A file removed today is still readable in yesterday's commit, so the tokens
+    inside it must be revoked (that part is a human decision — we only tell).
+    """
+    try:
+        result = subprocess.run(  # noqa: S603 - fixed argv, no shell
+            ["git", "-C", str(repo_dir), "log", f"--max-count={limit}",
+             "--name-only", "--pretty=format:"],
+            capture_output=True, timeout=20, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return name.encode() in result.stdout
+
+
 def _env_file_values(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
     if not path.exists():
@@ -61,6 +78,7 @@ def audit(repo_dir: Path | None = None, env_file: Path | None = None) -> dict:
     repo_dir = Path(repo_dir or Path(cfg.BASE_DIR))
     env_file = Path(env_file or Path(os.getenv("BOT_ENV_FILE", repo_dir / "config.env")))
     tracked = _git_tracked(repo_dir, env_file.name)
+    in_history = _git_history_names(repo_dir, env_file.name) if tracked is not None else False
     values = _env_file_values(env_file)
     present = {key for key, value in values.items() if value and value.lower() not in
                ("your_token_here", "change_me")}
@@ -71,6 +89,7 @@ def audit(repo_dir: Path | None = None, env_file: Path | None = None) -> dict:
         "secrets": sorted(present & set(SECRET_KEYS)),
         "private": sorted(present & set(PRIVATE_KEYS)),
         "in_environment": sorted(key for key in SECRET_KEYS if os.getenv(key)),
+        "in_history": in_history,
     }
 
 
@@ -80,6 +99,17 @@ def warning_lines(report: dict) -> list[str]:
     We only shout when the file is really committed: an untracked `config.env`
     with secrets is the intended setup, so it stays quiet.
     """
+    if report.get("secrets") and report.get("in_history") and not report.get("tracked"):
+        # The file was removed from the tree — good — but an older commit still
+        # holds it, so the leaked token has to be revoked once and for all.
+        return [
+            f"🚨 {report['path']} আগের কোনো কমিটে গিট ইতিহাসে রয়ে গেছে "
+            f"({', '.join(report['secrets'])})।",
+            "   ✅ ফাইলটি এখন আর কমিট হয় না — কিন্তু পুরোনো কমিটে মানটা এখনো পড়া যায়।",
+            "   ✅ তাই একবার অবশ্যই করুন: BotFather → /mybots → API Token → Revoke,",
+            "      নতুন টোকেন config.env-এ বসান; Telegram → Devices → অচেনা সেশন Terminate।",
+            "   বিস্তারিত: README.md → 💾 ডেটা, ব্যাকআপ ও নিরাপত্তা",
+        ]
     if not report.get("secrets") or not report.get("tracked"):
         return []
     where = "আপনার GitHub রিপোতে (পাবলিক হলে সবাই দেখছে)"
