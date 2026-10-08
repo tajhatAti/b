@@ -411,3 +411,35 @@ def test_store_force_channel_saved_from_the_site(client, monkeypatch):
     assert response.status_code == 303
     assert db.store_forcejoin(store["id"]) == "@store_channel"
     assert "@store_channel" in {t["ref"] for t in forcejoin.targets(store["id"])}
+
+
+# ---------------------------------------------------- new public pages (v3.1)
+def test_empty_site_never_shows_a_broken_page(client):
+    """A fresh deploy has no stores at all — the site must still look sane."""
+    page = client.get("/")
+    assert page.status_code == 200
+    assert "এখনো কোনো স্টোর নেই" in page.text
+    assert client.get("/stores").status_code == 200
+    assert client.get("/search?q=anything").status_code == 200
+
+
+def test_help_page_answers_the_obvious_questions(client):
+    page = client.get("/help")
+    assert page.status_code == 200
+    for phrase in ("কীভাবে ব্যবহার করবেন", "কেন?", "লিমিট শেষ"):
+        assert phrase in page.text
+
+
+def test_help_page_offers_a_way_to_reach_the_admin(client):
+    from app.services import settings
+    settings.set("SUPPORT_CONTACT", "@my_support")
+    page = client.get("/help")
+    assert "https://t.me/my_support" in page.text
+    settings.reset("SUPPORT_CONTACT")
+
+
+def test_home_teaches_the_three_steps(client):
+    _store("Free Movies")
+    page = client.get("/")
+    assert "কীভাবে ফাইল পাবেন" in page.text
+    assert "সোজা ভিডিও" in page.text

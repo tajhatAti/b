@@ -972,3 +972,55 @@ def test_duplicate_cleaner_removes_only_the_extras(clean):
     assert db.duplicate_files() == []
     assert len(db.files_of(store["id"])) == 1
     assert db.file(file_id) is not None             # the original stays
+
+
+# ------------------------------------------------------- per-user link limits
+def test_per_user_limit_stops_one_person_burning_every_click(clean):
+    store, file_id = _store_with_video()
+    token = db.create_link(ADMIN_ID, [file_id], None, kind="limited",
+                           max_clicks=100, per_user_limit=2)
+    assert db.link_take(token, user_id=21)["ok"]
+    assert db.link_take(token, user_id=21)["ok"]
+    third = db.link_take(token, user_id=21)
+    assert third["ok"] is False and third["reason"] == "user_limit"
+    assert third["per_user_limit"] == 2 and third["used_by_user"] == 2
+    # …but the rest of the batch is untouched for everybody else
+    assert db.link_take(token, user_id=22)["ok"]
+    uses = {row["user_id"]: row["times"] for row in db.link_uses(token)}
+    assert uses == {21: 2, 22: 1}
+    assert db.link_clicks(token) == 3
+
+
+@pytest.mark.asyncio
+async def test_repeat_visitor_gets_a_kind_explanation(clean, collected_sends,
+                                                      recorded_deliveries):
+    store, file_id = _store_with_video()
+    db.update_store(store["id"], is_premium=0)
+    token = db.create_link(ADMIN_ID, [file_id], None, kind="limited",
+                           max_clicks=50, per_user_limit=1)
+    event = GateEvent(USER_ID)
+    assert await flow.open_link(event, token) == flow.GATE_OK
+    assert recorded_deliveries == [(USER_ID, file_id)]
+
+    again = GateEvent(USER_ID)
+    state_value = await flow.open_link(again, token)
+    assert state_value == flow.GATE_LIMIT
+    assert recorded_deliveries == [(USER_ID, file_id)]          # nothing new sent
+    assert "আপনি ইতিমধ্যেই নিয়ে নিয়েছেন" in collected_sends[-1][1]
+    blocks = db.events(name="limit_block", user_id=USER_ID)
+    assert blocks, "the refusal must show up in the analytics"
+    assert any("per_user" in (row.get("detail") or "") for row in blocks)
+
+
+@pytest.mark.asyncio
+async def test_bot_link_flow_accepts_total_slash_per_user(clean, monkeypatch):
+    """`100/1` in the bot = 100 clicks total, one per person."""
+    from app.handlers import messages as messages_module
+    from tests.test_flows import FakeEvent
+    store, file_id = _store_with_video()
+    state.pending_input[ADMIN_ID] = {"action": "link_limit", "ctx": {"file_id": file_id}}
+    event = FakeEvent(ADMIN_ID, text="100/1")
+    await messages_module.pending_input(event)
+    link = db.links(limit=1)[0]
+    assert link["max_clicks"] == 100 and link["per_user_limit"] == 1
+    assert "একজন সর্বোচ্চ 1 বার" in event.sent[-1][0]

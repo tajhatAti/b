@@ -435,20 +435,28 @@ async def pending_input(event) -> None:
 
     if action == "link_limit":
         file_id = safe_int(ctx.get("file_id"))
-        limit = safe_int(text, -1)
-        if limit < 0:
+        # “100” = total clicks · “100/1” = total clicks / per person
+        raw = (text or "").strip().replace(" ", "")
+        total_part, _, per_user_part = raw.partition("/")
+        limit = safe_int(total_part, -1)
+        per_user = safe_int(per_user_part, 0) if per_user_part else 0
+        if limit < 0 or per_user < 0:
             ask(admin_id, action, **ctx)
-            await answer("⚠️ শুধু সংখ্যা লিখুন (যেমন 100), অথবা <code>0</code> = আনলিমিটেড।")
+            await answer("⚠️ শুধু সংখ্যা লিখুন — যেমন <code>100</code> "
+                         "(মোট ১০০ বার) বা <code>100/1</code> "
+                         "(মোট ১০০, একজন সর্বোচ্চ ১ বার) — <code>0</code> = আনলিমিটেড।")
             return
         file_row = db.file(file_id)
         if file_row is None:
             await answer("⚠️ ফাইলটি পাওয়া গেল না।")
             return
         token = db.create_link(admin_id, [file_id], None, kind="limited",
-                               max_clicks=limit, note="bot")
+                               max_clicks=limit, note="bot", per_user_limit=per_user)
         link = (f"https://t.me/{runtime.bot_username}?start=t{token}"
                 if runtime.bot_username else token)
         label = f"{limit} বার খোলা যাবে" if limit else "আনলিমিটেড"
+        if per_user:
+            label += f" · একজন সর্বোচ্চ {per_user} বার"
         await answer(
             f"🔗 <b>লিংক তৈরি হয়েছে</b> ({label})\n\n"
             f"<code>{link}</code>\n\n"

@@ -73,6 +73,13 @@ CREATE TABLE IF NOT EXISTS link_files (
     file_id INTEGER,
     PRIMARY KEY (token, file_id)
 );
+CREATE TABLE IF NOT EXISTS link_uses (
+    token   TEXT,
+    user_id INTEGER,
+    used_at REAL,
+    times   INTEGER DEFAULT 1,
+    PRIMARY KEY (token, user_id)
+);
 CREATE TABLE IF NOT EXISTS grants (
     store_id   INTEGER NOT NULL,
     user_id    INTEGER NOT NULL,
@@ -349,6 +356,8 @@ class Database:
             ("links", "max_clicks", "ALTER TABLE links ADD COLUMN max_clicks INTEGER DEFAULT 0"),
             ("links", "clicks", "ALTER TABLE links ADD COLUMN clicks INTEGER DEFAULT 0"),
             ("links", "kind2", "ALTER TABLE links ADD COLUMN kind2 TEXT DEFAULT ''"),
+            ("links", "per_user_limit", "ALTER TABLE links ADD COLUMN per_user_limit INTEGER DEFAULT 0"),
+            ("link_uses", "times", "ALTER TABLE link_uses ADD COLUMN times INTEGER DEFAULT 1"),
             ("files", "uid", "ALTER TABLE files ADD COLUMN uid TEXT"),
             ("files", "mirror_chat", "ALTER TABLE files ADD COLUMN mirror_chat INTEGER"),
             ("files", "mirror_msg", "ALTER TABLE files ADD COLUMN mirror_msg INTEGER"),
@@ -618,13 +627,15 @@ class Database:
     # ------------------------------------------------------------------- links
     def create_link(self, admin_id: int, file_ids: Iterable[int],
                     expires_at: float | None, kind: str = "multi",
-                    max_clicks: int = 0, note: str = "") -> str:
+                    max_clicks: int = 0, note: str = "",
+                    per_user_limit: int = 0) -> str:
         from app.utils import new_token
         token = new_token(10)
         self._run(
-            "INSERT INTO links(token, admin_id, kind, created_at, expires_at, max_clicks, kind2) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?)",
-            (token, admin_id, kind, time.time(), expires_at, max(0, int(max_clicks or 0)), note),
+            "INSERT INTO links(token, admin_id, kind, created_at, expires_at, max_clicks, "
+            "kind2, per_user_limit) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+            (token, admin_id, kind, time.time(), expires_at, max(0, int(max_clicks or 0)),
+             note, max(0, int(per_user_limit or 0))),
         )
         for fid in unique_keep_order(file_ids):
             self._run("INSERT OR IGNORE INTO link_files(token, file_id) VALUES(?, ?)", (token, fid))
@@ -641,15 +652,20 @@ class Database:
 
     def delete_link(self, token: str) -> None:
         self._run("DELETE FROM link_files WHERE token = ?", (token,))
+        self._run("DELETE FROM link_uses WHERE token = ?", (token,))
         self._run("DELETE FROM links WHERE token = ?", (token,))
 
     def link_clicks(self, token: str) -> int:
         row = self._one("SELECT clicks FROM links WHERE token = ?", (token,))
         return int(row["clicks"] or 0) if row else 0
 
-    def link_take(self, token: str) -> dict:
+    def link_take(self, token: str, user_id: int | None = None) -> dict:
         """Consume one click of a link. Atomic — two users clicking at the same
-        moment can never take more units than the link has left."""
+        moment can never take more units than the link has left.
+
+        When the link has a `per_user_limit`, one person cannot consume the whole
+        batch: the same user is refused after their own N clicks.
+        """
         now = time.time()
         row = self._one("SELECT * FROM links WHERE token = ?", (token,))
         if not row:
@@ -657,6 +673,11 @@ class Database:
         info = dict(row)
         if info.get("expires_at") and info["expires_at"] < now:
             return {"ok": False, "reason": "expired", "link": info}
+        per_user = int(info.get("per_user_limit") or 0)
+        used_by_me = self.link_uses_of(token, user_id) if (per_user and user_id) else 0
+        if per_user and user_id and used_by_me >= per_user:
+            return {"ok": False, "reason": "user_limit", "link": info,
+                    "per_user_limit": per_user, "used_by_user": used_by_me}
         limit = int(info.get("max_clicks") or 0)
         cur = self.conn.execute(
             "UPDATE links SET clicks = clicks + 1 WHERE token = ? AND (max_clicks = 0 OR clicks < max_clicks)",
@@ -666,9 +687,39 @@ class Database:
             return {"ok": False, "reason": "limit", "link": info,
                     "left": 0, "clicks": int(info.get("clicks") or 0), "limit": limit}
         self.conn.commit()
+        if user_id:
+            self.record_link_use(token, int(user_id))
         clicks = self.link_clicks(token)
         return {"ok": True, "link": info, "clicks": clicks, "limit": limit,
-                "left": max(0, limit - clicks) if limit else -1}
+                "left": max(0, limit - clicks) if limit else -1,
+                "per_user_limit": per_user,
+                "used_by_user": used_by_me + 1 if (per_user and user_id) else 0}
+
+    # ------------------------------------------------------------ link usage
+    def record_link_use(self, token: str, user_id: int) -> None:
+        """Remember who took the link (drives the per-user limit and the report)."""
+        self._run(
+            "INSERT INTO link_uses(token, user_id, used_at, times) VALUES(?, ?, ?, 1) "
+            "ON CONFLICT(token, user_id) DO UPDATE SET used_at = excluded.used_at, "
+            "times = COALESCE(link_uses.times, 0) + 1",
+            (token, int(user_id), time.time()),
+        )
+
+    def link_uses_of(self, token: str, user_id: int | None) -> int:
+        if not user_id:
+            return 0
+        row = self._one("SELECT times FROM link_uses WHERE token = ? AND user_id = ?",
+                        (token, int(user_id)))
+        return int(row["times"] or 0) if row else 0
+
+    def link_uses(self, token: str) -> list[dict]:
+        """Who took this link, and how many times (for the admin panel)."""
+        rows = self._q(
+            "SELECT u.user_id, COALESCE(u.times, 1) AS times, u.used_at, us.name, us.username "
+            "FROM link_uses u LEFT JOIN users us ON us.user_id = u.user_id "
+            "WHERE u.token = ? ORDER BY u.used_at DESC", (token,),
+        )
+        return [dict(r) for r in rows]
 
     def purge_expired_links(self) -> int:
         now = time.time()

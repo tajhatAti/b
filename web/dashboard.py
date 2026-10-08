@@ -160,6 +160,17 @@ CSS = """
  footer { color:var(--mut); font-size:13px; text-align:center; padding:28px 16px; }
  .logline { white-space:pre-wrap; word-break:break-word; border-bottom:1px solid #1a2334; padding:3px 2px; }
  .logline:first-child { color:#e8eef7; }
+ .howto { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px 16px;
+          margin:16px 0; display:flex; flex-wrap:wrap; gap:12px; align-items:center; font-size:14px; }
+ .howto b { color:var(--acc); }
+ .howto span { background:#1f2937; border-radius:999px; padding:4px 12px; }
+ ol.steps { padding-left:22px; } ol.steps li { margin:8px 0; }
+ details { background:var(--card); border:1px solid var(--line); border-radius:12px;
+           padding:12px 14px; margin:10px 0; }
+ details summary { cursor:pointer; font-weight:600; }
+ details p { color:var(--mut); margin:10px 0 2px; }
+ .kv { display:grid; grid-template-columns:auto 1fr; gap:4px 14px; font-size:14px; }
+ .kv div:nth-child(odd) { color:var(--mut); }
 """
 
 
@@ -167,6 +178,7 @@ def layout(title: str, body: str, active: str = "", admin: bool = True) -> str:
     public_nav = [
         ("/", "🏪 Stores"),
         ("/search", "🔍 Search"),
+        ("/help", "❓ Help"),
     ]
     admin_nav = [
         ("/admin", "📊 Dashboard"),
@@ -258,10 +270,64 @@ def create_app() -> FastAPI:
           {card("Members", stats['users'])}
           {card("Views", stats['views'])}
         </div>
+        <div class="howto">
+          <b>কীভাবে ফাইল পাবেন?</b>
+          <span>১️⃣ বট খুলুন</span><span>২️⃣ স্টোর বাছুন</span>
+          <span>৩️⃣ ভিডিওর নামে চাপ দিন — সোজা ভিডিও</span>
+        </div>
         <h3 id="stores">🏪 সব স্টোর</h3>
         {store_cards(stores)}
         """
         return layout("Home", body, "/", admin=_cookie_ok(request))
+
+    @app.get("/help", response_class=HTMLResponse)
+    async def public_help() -> str:
+        """A plain-language FAQ — the “users don't understand much” fix."""
+        contact = (settings.get_str("SUPPORT_CONTACT") or "").strip()
+        if contact.startswith(("http://", "https://", "tg://")):
+            contact_link = f'<a class="btn" href="{esc(contact)}">📞 অ্যাডমিনের সাথে কথা বলুন</a>'
+        elif contact.startswith("@"):
+            contact_link = (f'<a class="btn" href="https://t.me/{esc(contact[1:])}">'
+                            f'📞 অ্যাডমিনের সাথে কথা বলুন</a>')
+        else:
+            contact_link = ""
+        bots = _bot_username()
+        open_bot = f'<a class="btn" href="https://t.me/{bots}">🤖 বট খুলুন</a>' if bots else ""
+        steps = """
+        <ol class="steps">
+          <li><b>বট খুলুন</b> — নিচের বাটনে চাপ দিলেই টেলিগ্রামে চলে যাবেন।</li>
+          <li><b>স্টোর বেছে নিন</b> — 🏪 বাটনে চাপ দিলে সব স্টোর দেখতে পাবেন।</li>
+          <li><b>ভিডিওর নামে চাপ দিন</b> — ভিডিও সাথে সাথে চ্যাটে চলে আসবে, আর কিছু করতে হবে না।</li>
+        </ol>"""
+        faq = """
+        <details open><summary>ভিডিও পেতে কি টাকা লাগবে?</summary>
+        <p>ফ্রি স্টোরের সব ভিডিও বিনা পয়সায়। 🔒 দিয়ে লেখা স্টোরগুলো প্রিমিয়াম —
+        সেগুলোর জন্য বটের ভিতরে 💎 প্ল্যান থেকে কিনতে হয় (বিকাশ/নগদ/USDT)।</p></details>
+
+        <details><summary>চ্যানেল জয়েন করতে বলছে কেন?</summary>
+        <p>কিছু স্টোরে ভিডিওর আগে চ্যানেল জয়েন করা লাগে। একবার জয়েন করে
+        “✅ আমি জয়েন করেছি” চাপ দিলেই ভিডিও চলে আসবে — বারবার লাগবে না।</p></details>
+
+        <details><summary>“লিমিট শেষ” লিখছে — মানে কী?</summary>
+        <p>কিছু লিংকে কতবার খোলা যাবে সেটা ঠিক করা থাকে (যেমন ১০০ বার)। সেটা শেষ হলে
+        নতুন লিংক লাগবে — অ্যাডমিনের সাথে যোগাযোগ করুন, খুব দ্রুত দিয়ে দেবেন।</p></details>
+
+        <details><summary>ভিডিও ডাউনলোড করলে কি সেভ হয়ে থাকবে?</summary>
+        <p>হ্যাঁ। বট থেকে পাওয়া ভিডিও আপনার টেলিগ্রাম চ্যাটেই থাকে — পরে আবার দেখতে পারবেন,
+        ইন্টারনেট ছাড়াও।</p></details>
+
+        <details><summary>কিছু খুঁজে পাচ্ছি না</summary>
+        <p>🔍 Search-এ নাম লিখে দেখুন, নাহলে বটে 🆘 Help বা “অ্যাডমিনের সাথে কথা বলুন”
+        বাটনে চাপ দিন — সরাসরি মেসেজ চলে যাবে।</p></details>
+        """
+        body = f"""
+        <h2>❓ কীভাবে ব্যবহার করবেন</h2>
+        {steps}
+        <div class="row">{open_bot}{contact_link}</div>
+        <h3>সাধারণ প্রশ্ন</h3>
+        {faq}
+        """
+        return layout("Help", body, "/help")
 
     @app.get("/stores", response_class=HTMLResponse)
     async def public_stores() -> str:
@@ -1307,7 +1373,7 @@ def create_app() -> FastAPI:
     @app.post("/admin/links/new")
     async def admin_links_new(request: Request, file_ids: list[str] = Form(default=[]),
                               store_id: str = Form(""), max_clicks: int = Form(0),
-                              note: str = Form("")):
+                              note: str = Form(""), per_user: int = Form(0)):
         blocked = _guard(request)
         if blocked:
             return blocked
@@ -1315,8 +1381,10 @@ def create_app() -> FastAPI:
         if not ids:
             return RedirectResponse("/admin/links?warn=ফাইল+বাছুন", status_code=303)
         token = db.create_link(0, ids, None, kind="limited", max_clicks=max(0, max_clicks),
-                               note=note)
+                               note=note, per_user_limit=max(0, per_user))
         label = f"{max_clicks} ক্লিক" if max_clicks else "আনলিমিটেড"
+        if per_user:
+            label += f" · প্রতি ইউজার {per_user}"
         return RedirectResponse(
             f"/admin/links?flash=🔗+তৈরি:+{label}+·+{token}", status_code=303)
 

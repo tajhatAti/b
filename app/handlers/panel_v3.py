@@ -355,10 +355,16 @@ async def links_home(event, rest: str) -> None:
     for link in rows:
         limit = int(link.get("max_clicks") or 0)
         clicks = int(link.get("clicks") or 0)
+        per_user = int(link.get("per_user_limit") or 0)
         left = "♾" if not limit else max(0, limit - clicks)
+        used_by = db.link_uses(link["token"])
+        who = " · ".join(f"{esc(u.get('name') or u['user_id'])}×{u.get('times') or 1}"
+                         for u in used_by[:3])
         lines.append(f"<code>{esc(link['token'])}</code> — {clicks}"
-                     f"{'/' + str(limit) if limit else ''} ব্যবহৃত · বাকি {left} · "
-                     f"{esc((link.get('kind2') or '')[:24])}")
+                     f"{'/' + str(limit) if limit else ''} ব্যবহৃত · বাকি {left}"
+                     + (f" · একজন {per_user}" if per_user else "")
+                     + (f"\n   👥 {who}" if who else "")
+                     + f" · {esc((link.get('kind2') or '')[:24])}")
     if not rows:
         lines.append("<i>এখনো কোনো লিংক নেই।</i>")
     buttons = [
@@ -397,7 +403,8 @@ async def links_pick(event, rest: str) -> None:
     ask(event.sender_id, "link_limit", file_id=file_id)
     await event.respond(
         f"🔢 <b>এই লিংক কতবার খোলা যাবে?</b>\n\n"
-        f"শুধু সংখ্যাটি লিখুন (যেমন <code>100</code>)।\n"
+        f"শুধু সংখ্যাটি লিখুন (যেমন <code>100</code>) — অথবা "
+        f"<code>100/1</code> লিখলে মোট ১০০ বার, কিন্তু একজন ইউজার সর্বোচ্চ ১ বার।\n"
         f"ডিফল্ট <b>{default_limit}</b> — <code>0</code> দিলে আনলিমিটেড।\n"
         f"<i>/cancel = বাতিল</i>")
     await event.answer()

@@ -143,10 +143,20 @@ async def open_link(event, token: str, *, chat_id: int | None = None) -> str:
         return GATE_GONE
 
     is_admin = access.is_admin(user_id)
-    take = db.link_take(token) if not is_admin else {"ok": True, "clicks": db.link_clicks(token),
-                                                    "limit": int(link.get("max_clicks") or 0),
-                                                    "left": -1, "link": link}
+    take = db.link_take(token, user_id=user_id) if not is_admin else {
+        "ok": True, "clicks": db.link_clicks(token),
+        "limit": int(link.get("max_clicks") or 0), "left": -1, "link": link}
     if not take["ok"]:
+        if take["reason"] == "user_limit":
+            per_user = int(take.get("per_user_limit") or 0)
+            log("limit_block", user_id, None, None, token, f"per_user={per_user}")
+            await sender.send_text(
+                chat,
+                f"🙋 <b>আপনি ইতিমধ্যেই নিয়ে নিয়েছেন</b>\n\n"
+                f"এই লিংক থেকে একজন সর্বোচ্চ <b>{per_user}</b> বার নিতে পারেন — "
+                f"আপনি সেটা ব্যবহার করে ফেলেছেন।\nনতুন করে দরকার হলে অ্যাডমিনকে বলুন।",
+                buttons=contact_buttons())
+            return GATE_LIMIT
         if take["reason"] == "limit":
             limit = int(take.get("limit") or 0)
             log("limit_block", user_id, None, None, token, f"limit={limit}")

@@ -336,10 +336,17 @@ def links_body(flash: str = "", warn: str = "") -> str:
         open_link_html = (f"<a class='btn grey' href='{esc(url)}' target='_blank'>🔗</a> "
                           if url else "")
         delete_html = f"<a class='btn bad' href='/admin/links/delete/{link['token']}'>🗑</a>"
+        per_user = int(link.get("per_user_limit") or 0)
+        users = db.link_uses(link["token"])
+        who = ", ".join(
+            f"{esc(u.get('name') or ('user ' + str(u['user_id'])))}×{u.get('times') or 1}"
+            for u in users[:6]) or "<span class='muted'>এখনো কেউ নেয়নি</span>"
         rows.append(
             f"<tr><td><code>{esc(link['token'])}</code><div class='muted'>{esc(note)}</div></td>"
             f"<td>{esc(link.get('kind') or '')}</td>"
             f"<td>{clicks}</td><td>{limit or '♾'}</td><td>{left}</td>"
+            f"<td>{per_user or '♾'}</td>"
+            f"<td class='muted'>{who}</td>"
             f"<td>{_start(link.get('created_at'))}</td>"
             f"<td>{'⌛ ' + _start(link['expires_at']) if link.get('expires_at') else '♾'}</td>"
             f"<td>{open_link_html}{delete_html}</td></tr>")
@@ -357,14 +364,16 @@ def links_body(flash: str = "", warn: str = "") -> str:
         <select name=store_id><option value="">— সরাসরি —</option>{stores}</select>
         <label>কতবার খোলা যাবে (0 = আনলিমিটেড)</label>
         <input name=max_clicks type=number min=0 value="{settings.get_int('LINK_DEFAULT_LIMIT', 100)}">
+        <label>একজন ইউজার সর্বোচ্চ কতবার নিতে পারবে (0 = সীমা নেই)</label>
+        <input name=per_user type=number min=0 value="1">
         <label>নোট (নিজের জন্য)</label>
         <input name=note placeholder="যেমন: অমুক গ্রাহকের জন্য ১০০ ক্লিক">
         <button class="ok">🔗 লিংক বানান</button>
       </form>
     </div>
     <table><tr><th>টোকেন</th><th>ধরন</th><th>ব্যবহৃত</th><th>লিমিট</th><th>বাকি</th>
-    <th>তৈরি</th><th>মেয়াদ</th><th></th></tr>
-    {''.join(rows) or "<tr><td colspan=8 class='muted'>কোনো লিংক নেই</td></tr>"}</table>"""
+    <th>প্রতি ইউজার</th><th>কে নিয়েছে</th><th>তৈরি</th><th>মেয়াদ</th><th></th></tr>
+    {''.join(rows) or "<tr><td colspan=10 class='muted'>কোনো লিংক নেই</td></tr>"}</table>"""
 
 
 def store_forcejoin_body(store: dict) -> str:
