@@ -130,6 +130,16 @@ DB_FILE=preview.sqlite3 .venv/bin/python tools/seed_demo.py   # (ঐচ্ছি
 সব মান ডেটাবেজে সেভ হয় — **রিস্টার্ট লাগে না**। চাইলে পুরোনো মতো env ভেরিয়েবলও
 ব্যবহার করা যাবে (প্যানেলের মান সেটাকে ওভাররাইড করে)।
 
+### ডিপ্লয়ের আগে ৩০ সেকেন্ডের চেক
+
+```bash
+.venv/bin/python tools/static_check.py app web tools bot.py run.py   # undefined name = ক্র্যাশ
+.venv/bin/python -m pytest tests -q                                  # ২৮১টি টেস্ট
+```
+
+`static_check.py` না মিললে ডিপ্লয় করবেন না — এটাই সেই ক্লাসের বাগ ধরে যা বট
+কানেক্ট হওয়ার সাথে সাথে ক্র্যাশ করে (`NameError: scheduler` — একবার হয়েছিল)।
+
 ### সেটআপের পর একবার করে দেখে নিন
 
 1. `/admin/self-test` — সব ✅ কিনা (বিশেষ করে মিডিয়া ক্যাশ আর চ্যানেল)।
