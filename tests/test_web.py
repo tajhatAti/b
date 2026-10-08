@@ -656,3 +656,38 @@ def test_the_panel_host_variable_is_followed(tmp_path):
                          cwd=str(root), env=env, capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == "127.0.0.1"        # an explicit value still wins
+
+
+def test_requirements_txt_carries_the_whole_hosted_run():
+    """A panel installs `requirements.txt` and nothing else.
+
+    Repo-mode dependency installation in the runner is `_install_repo_deps`
+    (`pip install -r requirements.txt`); the import scanner only runs for inline
+    code. If the web stack were listed in `requirements-web.txt` only, the hosted
+    job would boot without fastapi/uvicorn and never open its port.
+    """
+    import ast
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    stdlib = set(sys.stdlib_module_names)
+    local = {"app", "web", "tools", "tests", "main", "run", "bot"}
+    modules: set[str] = set()
+    files = [root / "main.py", root / "run.py", root / "bot.py"]
+    files += sorted((root / "app").rglob("*.py")) + sorted((root / "web").rglob("*.py"))
+    for path in files:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                modules |= {alias.name.split(".")[0] for alias in node.names}
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                modules.add(node.module.split(".")[0])
+
+    requirements = (root / "requirements.txt").read_text(encoding="utf-8").lower()
+    third_party = {name for name in modules
+                   if name not in stdlib and name not in local and name != "__future__"}
+    missing = sorted(name for name in third_party if name not in requirements)
+    assert not missing, f"requirements.txt is missing {missing}"
+    for package in ("telethon", "fastapi", "uvicorn", "python-multipart"):
+        assert package in requirements, f"{package} must be installed on the panel"

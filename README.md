@@ -399,6 +399,10 @@ tests/                     # ২৮১টি টেস্ট — নেটওয
   মেনু, “বিস্তারিত”, ফর্ম ও ৩০৩ রিডাইরেক্ট সব লাইভ লিঙ্কের ভিতরেই থাকে।
 - জানতে চাইলে: `curl http://127.0.0.1:$PORT/health` → `port`, `host`, `from_port_env`,
   `url_prefix` — এই চারটা দেখলেই বোঝা যায় প্যানেলের লিঙ্ক ঠিক আছে কি না।
+- ডিপেন্ডেন্সি: প্যানেল **শুধু `requirements.txt`** ইনস্টল করে (রিপো মোডে `pip install -r
+  requirements.txt`; import-স্ক্যান শুধু inline কোডের জন্য চলে)। তাই ওয়েব স্ট্যাক
+  (`fastapi`, `uvicorn`, `python-multipart`) এখন `requirements.txt`-এই রাখা — আগে ওগুলো
+  শুধু `requirements-web.txt`-এ ছিল, আর হোস্টেড জবে সাইটটাই চালু হত না।
 - টেস্ট: `tests/test_web.py` আসল `python main.py` / `python bot.py` চালিয়ে `$PORT`
   খোলে কি না ও `/live/<job>/` প্রিফিক্স মানে কি না — দুটোই যাচাই করে।
 

@@ -31,7 +31,11 @@ python run.py
    ⚠️ `config.env` **কখনো** রিপোতে কমিট করবেন না — একবার গেলে ফাইল মুসলেও পুরোনো
    কমিটে মানটা থেকে যায়, তাই রিভোক করাই একমাত্র সমাধান (বট নিজেই সতর্কবার্তা দেবে)।
 2. CodeNest-এ নতুন bot/app বানান → **Own code / Upload** দিয়ে পুরো ফোল্ডার আপলোড করুন।
-3. **Start command**: `python run.py` (আগে `pip install -r requirements-web.txt` হবে)।
+3. **Start command**: `python main.py` (অথবা `python run.py` / `python bot.py`)।
+   প্যানেল নিজেই `requirements.txt` থেকে সব লাইব্রেরি বসায় — তাই **ওয়েব স্ট্যাকও
+   (`fastapi`, `uvicorn`, `python-multipart`) এখন `requirements.txt`-এ রাখা আছে**।
+   আগে ওগুলো শুধু `requirements-web.txt`-এ ছিল, আর প্যানেল ওই ফাইল পড়ে না — ফলে
+   সাইট চালু না হয়ে “no web listener yet” দেখাচ্ছিল।
 4. Environment variables সেট করুন (নিচের টেবিল দেখুন) — অথবা `config.env` ফাইল আপলোড করুন।
 
 ### 🔎 “The job is running, but no web listener yet” — কারণ ও সমাধান
