@@ -19,16 +19,58 @@ Event = events.common.EventCommon
 
 
 async def render(event, text: str, buttons=None, edit: bool = False):
-    """Edit the current message when possible, otherwise send a new one."""
+    """Show a screen. Never lets an edit/show hiccup leave the user with nothing.
+
+    Order: edit the message we are on → send a new message → plain text without
+    buttons. `safe_call` retries network hiccups, which is what used to make the
+    store list "sometimes not appear" on a bad connection.
+    """
     if edit:
         try:
-            return await event.edit(text, buttons=buttons, link_preview=False)
-        except Exception:
-            pass
+            return await safe_call(event.edit, text, buttons=buttons, link_preview=False,
+                                   what="edit", retries=1, raise_after_retries=False)
+        except Exception as exc:
+            log.debug("edit failed, sending a new message instead: %s", exc)
     try:
-        return await event.respond(text, buttons=buttons, link_preview=False)
+        return await safe_call(event.respond, text, buttons=buttons, link_preview=False,
+                               what="respond", retries=2, raise_after_retries=False)
     except Exception as exc:
-        log.debug("render failed: %s", exc)
+        log.warning("render could not show the screen: %s", exc)
+    # Last resort: plain text, no buttons — the user always gets an answer.
+    try:
+        return await event.respond(text)
+    except Exception as exc:
+        log.error("render failed completely: %s", exc)
+        return None
+
+
+def home_reply_keyboard():
+    """Bottom keyboard that is always there, so a user can never get stuck.
+
+    Reply keyboards work even when inline buttons fail (old message deleted,
+    FloodWait on edits, …) — one tap and the menu is back.
+    """
+    try:
+        from telethon.tl.custom import Button
+    except Exception:  # pragma: no cover
+        return None
+    return [
+        ["🏠 Store list", "🔍 Search"],
+        ["💎 My access", "🆘 Help"],
+    ]
+
+
+async def push_reply_keyboard(event, text: str | None = None):
+    """Show the persistent bottom keyboard (silently, on first contact)."""
+    try:
+        from telethon.tl.custom import Button
+        return await event.respond(
+            text or "নিচের বাটনগুলো সব সময় কাজ করবে 👇",
+            buttons=[[Button.text("🏠 Store list", resize=True), Button.text("🔍 Search", resize=True)],
+                     [Button.text("💎 My access", resize=True), Button.text("🆘 Help", resize=True)]],
+        )
+    except Exception as exc:
+        log.debug("reply keyboard failed: %s", exc)
         return None
 
 

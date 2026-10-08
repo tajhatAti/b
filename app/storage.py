@@ -225,7 +225,55 @@ CREATE TABLE IF NOT EXISTS welcome_cfg (
     admin_id INTEGER PRIMARY KEY,
     text     TEXT
 );
+
+-- ===================== v2.3: broadcast studio (campaign queue) =====================
+CREATE TABLE IF NOT EXISTS campaigns (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    admin_id     INTEGER,
+    title        TEXT,
+    text         TEXT,
+    files        TEXT,                 -- JSON list of file ids to attach ([] = text only)
+    audience     TEXT DEFAULT 'all',   -- all | premium | free | store:<id> | nosale:<id> | sub:<id>
+    status       TEXT DEFAULT 'draft', -- draft|queued|scheduled|running|paused|done|cancelled|failed
+    total        INTEGER DEFAULT 0,
+    sent         INTEGER DEFAULT 0,
+    failed       INTEGER DEFAULT 0,
+    blocked      INTEGER DEFAULT 0,
+    scheduled_at REAL,
+    created_at   REAL,
+    started_at   REAL,
+    finished_at  REAL,
+    last_error   TEXT
+);
+CREATE TABLE IF NOT EXISTS campaign_items (
+    campaign_id INTEGER NOT NULL,
+    user_id     INTEGER NOT NULL,
+    status      TEXT DEFAULT 'pending',   -- pending|sent|failed|blocked
+    attempts    INTEGER DEFAULT 0,
+    error       TEXT,
+    updated_at  REAL,
+    PRIMARY KEY (campaign_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_camp_status ON campaigns(status, scheduled_at);
+CREATE INDEX IF NOT EXISTS idx_camp_items  ON campaign_items(campaign_id, status);
 """
+
+
+def _json_int_list(raw: Any) -> list[int]:
+    """Read the `campaigns.files` JSON column tolerantly (never raises)."""
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        return []
+    out: list[int] = []
+    for item in data if isinstance(data, (list, tuple)) else []:
+        try:
+            out.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 class Database:
@@ -1103,7 +1151,168 @@ class Database:
         row = self._one("SELECT text FROM welcome_cfg WHERE admin_id = ?", (admin_id,))
         return row["text"] if row else ""
 
-    # ------------------------------------------------------- legacy migration
+    # =================================================== broadcaststudio (v2.3)
+    # A campaign is a saved broadcast + its per-user queue. The queue lives in
+    # SQLite, so a restart/hosting sleep never loses progress: the worker picks
+    # up exactly where it stopped.
+    CAMPAIGN_FIELDS = {"title", "text", "files", "audience", "status", "total",
+                       "sent", "failed", "blocked", "scheduled_at", "started_at",
+                       "finished_at", "last_error"}
+
+    def create_campaign(self, admin_id: int, *, title: str = "", text: str = "",
+                        files: list[int] | None = None, audience: str = "all",
+                        status: str = "draft",
+                        scheduled_at: float | None = None) -> int:
+        cur = self._run(
+            "INSERT INTO campaigns(admin_id, title, text, files, audience, status,"
+            " total, scheduled_at, created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (admin_id, title or "", text or "", json.dumps(files or []),
+             audience, status, 0, scheduled_at, time.time()),
+        )
+        return int(cur.lastrowid)
+
+    def campaign(self, campaign_id: int) -> dict | None:
+        row = self._dict(self._one("SELECT * FROM campaigns WHERE id = ?", (campaign_id,)))
+        if row is None:
+            return None
+        row["file_ids"] = _json_int_list(row.get("files"))
+        return row
+
+    def campaigns(self, limit: int = 50, status: str | None = None,
+                  admin_id: int | None = None) -> list[dict]:
+        sql = "SELECT * FROM campaigns"
+        params: list[Any] = []
+        where = []
+        if status:
+            where.append("status = ?")
+            params.append(status)
+        if admin_id is not None:
+            where.append("admin_id = ?")
+            params.append(admin_id)
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(int(limit))
+        rows = []
+        for row in self._q(sql, params):
+            item = dict(row)
+            item["file_ids"] = _json_int_list(item.get("files"))
+            rows.append(item)
+        return rows
+
+    def update_campaign(self, campaign_id: int, **fields: Any) -> None:
+        sets, params = [], []
+        for key, value in fields.items():
+            if key not in self.CAMPAIGN_FIELDS:
+                continue
+            if key == "files" and isinstance(value, (list, tuple)):
+                value = json.dumps(list(value))
+            sets.append(f"{key} = ?")
+            params.append(value)
+        if not sets:
+            return
+        params.append(campaign_id)
+        self._run(f"UPDATE campaigns SET {', '.join(sets)} WHERE id = ?", params)
+
+    def delete_campaign(self, campaign_id: int) -> None:
+        self._run("DELETE FROM campaign_items WHERE campaign_id = ?", (campaign_id,))
+        self._run("DELETE FROM campaigns WHERE id = ?", (campaign_id,))
+
+    def add_campaign_items(self, campaign_id: int, user_ids: Iterable[int]) -> int:
+        """Fill the queue. Existing rows are kept (resume/retry safe)."""
+        now = time.time()
+        before = self._one("SELECT COUNT(*) AS n FROM campaign_items WHERE campaign_id = ?",
+                           (campaign_id,))["n"]
+        with self.conn:
+            self.conn.executemany(
+                "INSERT OR IGNORE INTO campaign_items(campaign_id, user_id, status, updated_at)"
+                " VALUES(?,?, 'pending', ?)",
+                [(campaign_id, int(uid), now) for uid in user_ids],
+            )
+        after = self._one("SELECT COUNT(*) AS n FROM campaign_items WHERE campaign_id = ?",
+                          (campaign_id,))["n"]
+        self.update_campaign(campaign_id, total=after)
+        return after - before
+
+    def campaign_items(self, campaign_id: int, status: str | None = None,
+                       limit: int | None = None) -> list[dict]:
+        sql = "SELECT * FROM campaign_items WHERE campaign_id = ?"
+        params: list[Any] = [campaign_id]
+        if status:
+            sql += " AND status = ?"
+            params.append(status)
+        sql += " ORDER BY user_id"
+        if limit:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        return [dict(r) for r in self._q(sql, params)]
+
+    def campaign_user_ids(self, campaign_id: int, status: str | None = "pending",
+                          limit: int | None = None) -> list[int]:
+        sql = "SELECT user_id FROM campaign_items WHERE campaign_id = ?"
+        params: list[Any] = [campaign_id]
+        if status:
+            sql += " AND status = ?"
+            params.append(status)
+        sql += " ORDER BY user_id"
+        if limit:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        return [int(r["user_id"]) for r in self._q(sql, params)]
+
+    def mark_campaign_item(self, campaign_id: int, user_id: int, status: str,
+                           error: str = "") -> None:
+        self._run(
+            "UPDATE campaign_items SET status = ?, error = ?,"
+            " attempts = attempts + 1, updated_at = ?"
+            " WHERE campaign_id = ? AND user_id = ?",
+            (status, (error or "")[:200], time.time(), campaign_id, user_id),
+        )
+
+    def rearm_campaign_items(self, campaign_id: int, statuses: tuple[str, ...] = ("failed",)) -> int:
+        """Put failed/blocked items back in the queue (used by “retry”)."""
+        marks = ",".join("?" for _ in statuses)
+        cur = self._run(
+            f"UPDATE campaign_items SET status = 'pending', updated_at = ?"
+            f" WHERE campaign_id = ? AND status IN ({marks})",
+            (time.time(), campaign_id, *statuses),
+        )
+        return int(cur.rowcount or 0)
+
+    def campaign_counts(self, campaign_id: int, sync: bool = True) -> dict:
+        rows = self._q(
+            "SELECT status, COUNT(*) AS n FROM campaign_items WHERE campaign_id = ?"
+            " GROUP BY status", (campaign_id,),
+        )
+        counts = {row["status"]: row["n"] for row in rows}
+        counts.setdefault("pending", 0)
+        counts.setdefault("sent", 0)
+        counts.setdefault("failed", 0)
+        counts.setdefault("blocked", 0)
+        counts["total"] = sum(counts[k] for k in ("pending", "sent", "failed", "blocked"))
+        counts["done"] = counts["sent"] + counts["failed"] + counts["blocked"]
+        if sync:
+            self.update_campaign(campaign_id, sent=counts["sent"], failed=counts["failed"],
+                                 blocked=counts["blocked"], total=counts["total"])
+        return counts
+
+    def due_campaigns(self, now: float | None = None) -> list[dict]:
+        now = time.time() if now is None else now
+        rows = self._q("SELECT * FROM campaigns WHERE status = 'scheduled' AND"
+                       " (scheduled_at IS NULL OR scheduled_at <= ?) ORDER BY id", (now,))
+        return [self._with_files(dict(r)) for r in rows]
+
+    def queued_campaigns(self) -> list[dict]:
+        return [self._with_files(dict(r)) for r in
+                self._q("SELECT * FROM campaigns WHERE status IN ('queued','running')"
+                        " ORDER BY id")]
+
+    @staticmethod
+    def _with_files(row: dict) -> dict:
+        row["file_ids"] = _json_int_list(row.get("files"))
+        return row
+
+    # ------------------------------------------------------------------- users
     def migrate_legacy(self, legacy_path: str) -> dict | None:
         """Import the old JSON database. Safe to call repeatedly."""
         path = Path(legacy_path)

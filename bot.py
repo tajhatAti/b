@@ -21,6 +21,10 @@ async def on_startup(client: TelegramClient) -> None:
     me = await client.get_me()
     runtime.bot_username = me.username or ""
     runtime.bot_id = me.id
+    # Remember it in the database too: the public website can then build
+    # t.me deep links even while the bot itself is offline.
+    if runtime.bot_username:
+        db.set_meta("bot_username", runtime.bot_username)
     log.info("Bot online as @%s (id=%s)", runtime.bot_username, me.id)
 
     stats = db.stats()
@@ -130,6 +134,23 @@ def main() -> int:
         except Exception:
             pass
     return 0
+
+
+async def serve_website() -> None:
+    """Serve the store front + admin panel in this same process."""
+    try:
+        import uvicorn
+
+        from web.dashboard import app as web_app
+
+        server = uvicorn.Server(uvicorn.Config(web_app, host=cfg.WEB_HOST,
+                                               port=cfg.WEB_PORT, log_level="info",
+                                               access_log=False))
+        log.info("Website on http://%s:%s (admin user %s)",
+                 cfg.WEB_HOST, cfg.WEB_PORT, cfg.WEB_USER)
+        await server.serve()
+    except Exception as exc:
+        log.error("Website could not start: %s", exc)
 
 
 async def disconnect_all(client: TelegramClient) -> None:

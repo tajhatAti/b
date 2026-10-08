@@ -50,3 +50,15 @@ ADMIN_HELP = (
 
 def access_denied(store_name: str) -> str:
     return PREMIUM_LOCK.format(store=esc(store_name))
+
+
+# ------------------------------------------- persistent bottom (reply) keyboard
+# These four texts are always visible under the message box. They are handled by
+# a dedicated handler and ignored by every "waiting for your input" flow, so a
+# user can always get back to the store list without knowing any command.
+REPLY_HOME = "🏠 Store list"
+REPLY_SEARCH = "🔍 Search"
+REPLY_ACCESS = "💎 My access"
+REPLY_HELP = "🆘 Help"
+
+REPLY_BUTTONS = {REPLY_HOME, REPLY_SEARCH, REPLY_ACCESS, REPLY_HELP}

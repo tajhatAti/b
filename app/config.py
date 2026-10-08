@@ -106,6 +106,16 @@ BROADCAST_DELAY = get_float("BROADCAST_DELAY", 0.35)
 DRIP_SEND_DELAY = get_float("DRIP_SEND_DELAY", 0.5)
 FLOOD_SAFETY_MAX = get_int("FLOOD_SAFETY_MAX", 900)   # wait up to 15 min on FloodWait
 
+# ------------------------------------------------------ broadcast studio (v3)
+# A campaign sends up to BROADCAST_MAX_FILES files per user, waits BROADCAST_DELAY
+# between messages and takes a longer nap every BROADCAST_BATCH messages — this is
+# what keeps a 5,000-user broadcast alive instead of hitting Telegram's limits.
+BROADCAST_MAX_FILES = get_int("BROADCAST_MAX_FILES", 5)
+BROADCAST_MEDIA_DELAY = get_float("BROADCAST_MEDIA_DELAY", 1.0)
+BROADCAST_BATCH = get_int("BROADCAST_BATCH", 25)
+BROADCAST_BATCH_PAUSE = get_float("BROADCAST_BATCH_PAUSE", 3.0)
+BROADCAST_AUTO_RESUME = get_bool("BROADCAST_AUTO_RESUME", True)
+
 # ---------------------------------------------------------------------- paths
 DB_FILE = get_str("DB_FILE", str(BASE_DIR / "bot_data.sqlite3"))
 LEGACY_DB_FILE = get_str("LEGACY_DB_FILE", str(BASE_DIR / "bot_db.json"))
@@ -139,10 +149,17 @@ INLINE_RESULTS = get_int("INLINE_RESULTS", 20)
 # --------------------------------------------------------------- web dashboard
 WEB_ENABLED = get_bool("WEB_ENABLED", False)
 WEB_HOST = get_str("WEB_HOST", "0.0.0.0")
-WEB_PORT = get_int("WEB_PORT", 8080)
+# Hosting panels (CodeNest, Render, Railway, …) inject $PORT and route to it.
+WEB_PORT = get_int("PORT", get_int("WEB_PORT", 8080))
 WEB_USER = get_str("WEB_USER", "admin")
 WEB_PASS = get_str("WEB_PASS")
 WEB_SECRET = get_str("WEB_SECRET", "")
+WEB_SESSION_HOURS = get_int("WEB_SESSION_HOURS", 72)
+WEB_TITLE = get_str("WEB_TITLE", "Store")
+# Public site settings
+SITE_ENABLED = get_bool("SITE_ENABLED", True)
+SITE_TAGLINE = get_str("SITE_TAGLINE", "")
+SITE_CONTACT = get_str("SITE_CONTACT", "")
 
 # ----------------------------------------------------------------- localization
 DEFAULT_LANG = get_str("DEFAULT_LANG", "bn")

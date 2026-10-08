@@ -117,6 +117,16 @@ def unregister_client(admin_id: int) -> None:
     bot_entity_cache.pop(admin_id, None)
 
 
+def bot_online() -> bool:
+    """True only when the bot really finished signing in.
+
+    A client object exists from the first moment we try to connect, so checking
+    `get_client() is not None` would lie — and a broadcast started against a bot
+    that is not online would burn its queue with failures.
+    """
+    return _client is not None and bool(bot_id)
+
+
 def is_online(admin_id: int) -> bool:
     client = user_clients.get(admin_id)
     if client is None:

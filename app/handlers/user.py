@@ -141,44 +141,68 @@ async def handle_payload(event, user_id: int, payload: str, is_new: bool) -> boo
 
 
 async def show_home(event, user_id: int, edit: bool = False):
+    """The main screen. Written so it can *never* fail silently.
+
+    When something goes wrong the user still gets a plain message with a way
+    back — that was the real reason a store list sometimes "did not come".
+    """
     from app import i18n
-    # Banned check
+
+    # Banned check (never let it break the home screen)
     try:
         if db.is_banned(user_id) and not access.is_admin(user_id):
             await ui.render(event, "🚫 <b>আপনি ব্যান হয়েছেন</b>\nঅ্যাডমিনের সাথে যোগাযোগ করুন।",
                             [[Button.inline(i18n.t(user_id, "contact_button"), "ct:0")]], edit=edit)
             return
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("ban check skipped: %s", exc)
 
-    stores = db.all_stores()
+    try:
+        stores = db.all_stores()
+    except Exception as exc:
+        log.exception("could not read the store list: %s", exc)
+        stores = []
+
     if not stores:
-        await ui.render(event, "👋 <b>Welcome!</b>\nNo content stores are available right now.",
-                        None, edit=edit)
+        await ui.render(
+            event,
+            "👋 <b>স্বাগতম!</b>\n\nএখনো কোনো স্টোর তৈরি হয়নি — অ্যাডমিন শীঘ্রই "
+            "কনটেন্ট যোগ করবেন।\nনিচের বাটনে চাপ দিয়ে অ্যাডমিনকে জানাতে পারেন।",
+            [[Button.inline(i18n.t(user_id, "contact_button"), "ct:0")],
+             [Button.inline(i18n.t(user_id, "language_button"), "lang")]],
+            edit=edit,
+        )
         return
 
-    # Custom welcome if admin set one
+    # Custom welcome if the admin set one
+    banner = ""
     try:
-        # Use primary admin's welcome if exists
-        welcome = ""
         if cfg.ADMIN_IDS:
-            welcome = db.welcome_text(cfg.ADMIN_IDS[0])
-        banner = welcome if welcome else i18n.t(user_id, "home_banner")
-    except Exception:
+            banner = db.welcome_text(cfg.ADMIN_IDS[0])
+    except Exception as exc:
+        log.debug("welcome text unavailable: %s", exc)
+    if not banner:
         banner = i18n.t(user_id, "home_banner")
 
     buttons = keyboards.user_store_list(stores)
     buttons.extend([
-        [Button.inline(i18n.t(user_id, "invite_button"), "rf"),
-         Button.inline(i18n.t(user_id, "favorites_button"), "fvs")],
         [Button.inline(i18n.t(user_id, "search_all"), "gs"),
-         Button.inline(i18n.t(user_id, "my_access_button"), "mya")],
-        [Button.inline(i18n.t(user_id, "request_button"), "rq:0")],
-        [Button.inline(i18n.t(user_id, "contact_button"), "ct:0"),
+         Button.inline(i18n.t(user_id, "my_access_button"), "mya:0")],
+        [Button.inline(i18n.t(user_id, "invite_button"), "rf"),
          Button.inline(i18n.t(user_id, "help_button"), "hp")],
+        [Button.inline(i18n.t(user_id, "request_button"), "rq:0"),
+         Button.inline(i18n.t(user_id, "contact_button"), "ct:0")],
         [Button.inline(i18n.t(user_id, "language_button"), "lang")],
     ])
     await ui.render(event, banner, buttons, edit=edit)
+
+    # Keep the bottom keyboard present, so the menu is always one tap away.
+    if not edit:
+        try:
+            await ui.push_reply_keyboard(event)
+        except Exception as exc:
+            log.debug("reply keyboard skipped: %s", exc)
+
 
 
 # ------------------------------------------------------------------- commands
@@ -351,3 +375,64 @@ async def receive_file(event, rest: str) -> None:
     await event.answer("✅ Sent!" if sent else "")
     if sent:
         await ui.strip_button(event, event.data)
+
+
+# ------------------------------------------------- bottom (reply) keyboard (v2.3)
+@bot.on(events.NewMessage(func=lambda e: e.is_private and not e.out
+                          and (e.raw_text or "").strip() in texts.REPLY_BUTTONS))
+async def reply_menu_buttons(event) -> None:
+    """Handle the four permanent bottom buttons.
+
+    Registered on its own so a user never has to remember a command: even if
+    inline buttons are broken (deleted message, FloodWait, old client), the
+    bottom keyboard always brings the store list back.
+    """
+    from app.handlers import state
+    user_id = event.sender_id
+    label = (event.raw_text or "").strip()
+    state.clear(user_id)                      # the menu button cancels any flow
+
+    try:
+        sender = await event.get_sender()
+        db.touch_user(user_id, getattr(sender, "first_name", None),
+                      getattr(sender, "username", None))
+    except Exception:
+        pass
+
+    if label == texts.REPLY_HOME:
+        await show_home(event, user_id)
+        return
+    if label == texts.REPLY_SEARCH:
+        state.ask(user_id, "global_search")
+        await event.respond("🔎 <b>সার্চ</b>\nযা খুঁজছেন লিখে পাঠান — সব স্টোরে খুঁজে দেব "
+                            "(<i>/cancel লিখলে বাতিল</i>)।")
+        return
+    if label == texts.REPLY_ACCESS:
+        from app.handlers.billing import my_access
+        await my_access(event, "0")
+        return
+    if label == texts.REPLY_HELP:
+        text = texts.HELP_TEXT
+        if access.is_admin(user_id):
+            text += "\n\n" + texts.ADMIN_HELP
+        await event.respond(text,
+                            buttons=[[Button.inline("🏠 স্টোর লিস্ট", "bs:0")]])
+        return
+
+
+@bot.on(events.NewMessage(func=lambda e: e.is_private,
+                          pattern=r"^/(menu|home|stores|start@\w+)(\s|$)"))
+async def menu_command(event) -> None:
+    """`/menu` — always show the store list (works even if /start was lost)."""
+    user_id = event.sender_id
+    try:
+        sender = await event.get_sender()
+        db.touch_user(user_id, getattr(sender, "first_name", None),
+                      getattr(sender, "username", None))
+    except Exception:
+        pass
+    if access.is_admin(user_id) and (event.raw_text or "").strip().startswith("/menu"):
+        from app.handlers.admin import send_panel
+        await send_panel(event)
+        return
+    await show_home(event, user_id)

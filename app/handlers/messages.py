@@ -172,6 +172,9 @@ async def search_input(event) -> None:
     text = (event.raw_text or "").strip()
     if text.startswith("/"):
         return
+    if text in texts.REPLY_BUTTONS:
+        search_pending.pop(user_id, None)      # the bottom menu wins
+        return
     store_id = search_pending.pop(user_id)
     store = db.store(store_id)
     if store is None:
@@ -207,6 +210,9 @@ async def pending_input(event) -> None:
     text = (event.raw_text or "").strip()
     if text.startswith("/"):
         return                                     # /cancel and friends win
+    if text in texts.REPLY_BUTTONS:
+        take(admin_id)                             # the bottom menu wins
+        return
     take(admin_id)
     action = pending["action"]
     ctx = pending["ctx"]
@@ -817,7 +823,61 @@ async def pending_input(event) -> None:
             pass
         return
 
+    # ------------------------------------------------------ broadcast studio
+    if action == "studio_text":
+        audience = ctx.get("audience") or "all"
+        file_id = ctx.get("file_id") or 0
+        body = (event.raw_text or "").strip()
+        if not body and not file_id:
+            ask(admin_id, "studio_text", **ctx)
+            await answer("⚠️ খালি মেসেজ পাঠানো যাবে না — টেক্সট লিখুন বা 🎬 ফাইল বেছে নিন।")
+            return
+        body = _safe_html(body)
+        campaign = broadcast.create_campaign(
+            admin_id, text=body, audience=audience,
+            files=[file_id] if file_id else [], start=False,
+        )
+        from app.handlers.admin import _render_campaign
+        await answer("🧾 ক্যাম্পেইন তৈরি — নিচে প্রিভিউ দেখে নিশ্চিত করুন।")
+        await _render_campaign(event, campaign["id"], edit=False)
+        return
+
+    if action == "studio_time":
+        from app.utils import local_now
+        campaign_id = safe_int(ctx.get("campaign_id"))
+        if db.campaign(campaign_id) is None:
+            await answer("⚠️ ক্যাম্পেইনটি আর নেই।")
+            return
+        match = TIME_RE.match(text)
+        if not match:
+            ask(admin_id, "studio_time", **ctx)
+            await answer("⚠️ সময় <b>HH:MM</b> ফরম্যাটে লিখুন (যেমন 21:30)।")
+            return
+        hour, minute = int(match.group(1)), int(match.group(2))
+        from datetime import timedelta
+        when = local_now().replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if when.timestamp() <= time.time():
+            when = when + timedelta(days=1)     # this time already passed → tomorrow
+        db.update_campaign(campaign_id, status="scheduled", scheduled_at=when.timestamp())
+        from app.handlers.admin import _render_campaign
+        from app.utils import fmt_ts
+        await answer(f"📅 {fmt_ts(when.timestamp(), '%d %b %H:%M')} এ পাঠানো হবে।")
+        await _render_campaign(event, campaign_id, edit=False)
+        return
+
     await answer(texts.UNKNOWN_INPUT)
+
+
+def _safe_html(raw: str) -> str:
+    """Let admins use <b>/<a> tags, but never let broken HTML kill the send."""
+    if not raw:
+        return ""
+    try:
+        from telethon.extensions import html as tl_html
+        tl_html.parse(raw)
+        return raw
+    except Exception:
+        return esc(raw)
 
 
 # ------------------------------------------------------------------- helpers

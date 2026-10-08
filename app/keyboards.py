@@ -285,6 +285,7 @@ def file_manager(store: dict, files: list[dict], page: int, total: int) -> list[
 def file_actions(file_id: int, store_id: int) -> list[list[Button]]:
     return [
         [Button.inline("✏️ Rename", f"fmr:{file_id}"), Button.inline("🔗 Get link", f"fml:{file_id}")],
+        [Button.inline("📢 Broadcast this video", f"fbr:{file_id}")],
         [Button.inline("📦 Move", f"fmm:{file_id}"), Button.inline("🗑 Delete", f"fmd:{file_id}")],
         [Button.inline("🔙 Back to files", f"fm:{store_id}")],
     ]
@@ -335,4 +336,104 @@ def store_access_list(store: dict, grants: list[dict], page: int = 0, per_page: 
         rows.append(nav)
     rows.append([Button.inline("👑 Grant new", f"gst:{store['id']}"), Button.inline("➕ Bulk grant", f"gbulk:{store['id']}")])
     rows.append([Button.inline("🔙 Back to store settings", f"sss:{store['id']}")])
+    return rows
+
+
+# ===================================================== broadcast studio (v3)
+def broadcast_studio_menu(running: int = 0, scheduled: int = 0, total: int = 0) -> list[list[Button]]:
+    """High-level broadcast entry: new, scheduled, history, per-file."""
+    rows: list[list[Button]] = [
+        [Button.inline("📣 New broadcast", "nbcnew")],
+    ]
+    second: list[Button] = []
+    if running:
+        second.append(Button.inline(f"⏳ Running ({running})", "nbclist:running"))
+    if scheduled:
+        second.append(Button.inline(f"📅 Scheduled ({scheduled})", "nbclist:scheduled"))
+    if second:
+        rows.append(second)
+    rows.append([Button.inline(f"📜 History ({total})" if total else "📜 History", "nbclist:done")])
+    rows.append([Button.inline("🎬 Broadcast one video", "adm:files"),
+                 Button.inline("🔔 Daily drip", "adm:drip")])
+    rows.append([Button.inline("📈 Audience size", "nbcsize"),
+                 Button.inline("⚙️ Broadcast speed", "nbcsetup")])
+    rows.append([Button.inline("🔙 Back", "adm:growth")])
+    return rows
+
+
+def broadcast_audience_picker(stores: list[dict], prefix: str = "nbca:",
+                              back: str = "adm:bc") -> list[list[Button]]:
+    """Pick who receives the campaign. Per store: everyone / subscribers / never bought."""
+    rows: list[list[Button]] = [
+        [Button.inline("📣 All users", f"{prefix}all"),
+         Button.inline("💎 Premium buyers", f"{prefix}premium")],
+        [Button.inline("🆓 Free users", f"{prefix}free")],
+    ]
+    for store in stores:
+        rows.append([Button.inline(f"🏪 {cut(store['name'], 22)}", "noop")])
+        rows.append([
+            Button.inline("👥 Everyone", f"{prefix}store:{store['id']}"),
+            Button.inline("🔔 Subscribers", f"{prefix}sub:{store['id']}"),
+        ])
+        rows.append([Button.inline("🎯 Never bought", f"{prefix}nosale:{store['id']}")])
+    rows.append([Button.inline("🔙 Back", back)])
+    return rows
+
+
+def broadcast_confirm(campaign_id: int) -> list[list[Button]]:
+    return [
+        [Button.inline("🚀 Send now", f"nbcgo:{campaign_id}"),
+         Button.inline("🧪 Test to me", f"nbctest:{campaign_id}")],
+        [Button.inline("📅 Schedule", f"nbcwhen:{campaign_id}"),
+         Button.inline("🗑 Discard", f"nbcdel:{campaign_id}")],
+    ]
+
+
+_STATUS_ICON = {"draft": "📝", "queued": "🕓", "scheduled": "📅", "running": "⏳",
+                "done": "✅", "cancelled": "🚫", "failed": "❌", "paused": "⏸"}
+
+
+def campaign_list(campaigns: list[dict], back: str = "adm:bc") -> list[list[Button]]:
+    rows: list[list[Button]] = []
+    for campaign in campaigns:
+        icon = _STATUS_ICON.get(campaign.get("status", ""), "•")
+        label = f"{icon} #{campaign['id']} {cut(campaign.get('title') or campaign.get('text') or 'campaign', 22)}"
+        rows.append([Button.inline(label, f"nbcd:{campaign['id']}")])
+    if not rows:
+        rows.append([Button.inline("— nothing here yet —", "noop")])
+    rows.append([Button.inline("📣 New broadcast", "nbcnew"),
+                 Button.inline("🔙 Back", back)])
+    return rows
+
+
+def campaign_detail(campaign: dict) -> list[list[Button]]:
+    cid = campaign["id"]
+    status = campaign.get("status")
+    rows: list[list[Button]] = []
+    if status in ("queued", "scheduled", "draft"):
+        rows.append([Button.inline("🚀 Send now", f"nbcgo:{cid}"),
+                     Button.inline("🧪 Test to me", f"nbctest:{cid}")])
+    if status == "running":
+        rows.append([Button.inline("⏹ Stop", f"nbcstop:{cid}"),
+                     Button.inline("🔄 Refresh", f"nbcd:{cid}")])
+    if status in ("done", "cancelled") :
+        rows.append([Button.inline("🔁 Retry failed", f"nbcagain:{cid}")])
+    rows.append([Button.inline("🗑 Delete", f"nbcdel:{cid}"),
+                 Button.inline("🔙 Back", "nbclist:all")])
+    return rows
+
+
+def file_broadcast_picker(file_id: int, stores: list[dict],
+                          back: str | None = None) -> list[list[Button]]:
+    """Audience picker for a single video/file (the `fbr:` flow)."""
+    rows: list[list[Button]] = [
+        [Button.inline("📣 Everyone", f"fbrgo:{file_id}:all"),
+         Button.inline("💎 Premium", f"fbrgo:{file_id}:premium")],
+        [Button.inline("🆓 Free users", f"fbrgo:{file_id}:free")],
+    ]
+    for store in stores:
+        rows.append([Button.inline(f"🎯 Never bought {cut(store['name'], 16)}",
+                                   f"fbrgo:{file_id}:nosale:{store['id']}")])
+    rows.append([Button.inline("🧪 Test to me", f"fbrtest:{file_id}")])
+    rows.append([Button.inline("🔙 Back", back or f"fm:{file_id}")])
     return rows

@@ -20,7 +20,7 @@ from app.handlers.state import (ask, batch_mode, ctx as flow_ctx,
                                 dialog_cache, flow)
 from app.logger import log
 from app.runtime import bot, spawn
-from app.services import access, scanner
+from app.services import access, broadcast, scanner
 from app.services.telegram import flood_status
 from app.storage import db
 from app.utils import esc, fmt_ts, human_delta, local_time_str, safe_int
@@ -415,9 +415,7 @@ async def admin_action(event, action: str) -> None:
         await event.respond("📦 <b>Batch mode on.</b> Forward photos/videos here and send /done "
                             "when you are finished — you'll get one link for all of them.")
     elif action == "bc":
-        stores = db.stores_admin(admin_id)
-        await ui.render(event, "📢 <b>Who should receive this broadcast?</b>",
-                        keyboards.broadcast_filters(stores), edit=True)
+        await show_studio(event, admin_id, edit=True)
     elif action == "gp":
         # Improved grant flow: pick store first if not already in flow
         flow_ctx_store = flow_ctx(admin_id).get("store_id")
@@ -858,3 +856,326 @@ async def finish_batch(event) -> None:
         "<i>⚠️ Anyone with this link can receive these files, so share it carefully. "
         "It never expires — delete the link any time.</i>"
     )
+
+
+# ======================================================= broadcast studio (v2.3)
+# A campaign has its own queue in SQLite, so a broadcast survives a restart and
+# a “5,000 users” send never dies half way. Everything here works from the bot
+# *and* from the website panel (both use app.services.broadcast).
+def _campaign_icon(status: str) -> str:
+    return {"draft": "📝", "queued": "🕓", "scheduled": "📅", "running": "⏳",
+            "done": "✅", "cancelled": "🚫", "failed": "❌"}.get(status, "•")
+
+
+def _campaign_line(campaign: dict) -> str:
+    counts = db.campaign_counts(campaign["id"], sync=False)
+    return (f"{_campaign_icon(campaign['status'])} <b>#{campaign['id']}</b> "
+            f"{esc(campaign.get('title') or '')} — {broadcast.audience_label(campaign['audience'])}\n"
+            f"    ✅ {counts['sent']} · ⚠️ {counts['failed']} · 🚫 {counts['blocked']} · "
+            f"🕓 {counts['pending']} / {counts['total']}")
+
+
+async def show_studio(event, admin_id: int, edit: bool = True) -> None:
+    all_campaigns = db.campaigns(limit=200, admin_id=admin_id)
+    running = sum(1 for c in all_campaigns if c["status"] == "running")
+    scheduled = sum(1 for c in all_campaigns if c["status"] == "scheduled")
+    done = sum(1 for c in all_campaigns if c["status"] == "done")
+    text = (
+        "📢 <b>ব্রডকাস্ট স্টুডিও</b>\n\n"
+        "যেকোনো ভিডিও/ফাইল বা টেক্সট — সব ইউজার, প্রিমিয়াম, ফ্রি বা নির্দিষ্ট স্টোরের "
+        "মানুষকে পাঠাতে পারবেন। কিউ ডেটাবেজে থাকে, তাই বট রিস্টার্ট হলেও ব্রডকাস্ট "
+        "বন্ধ হয় না।\n\n"
+        f"⏳ চলছে: <b>{running}</b> · 📅 শিডিউল: <b>{scheduled}</b> · ✅ শেষ: <b>{done}</b>"
+    )
+    await ui.render(event, text,
+                    keyboards.broadcast_studio_menu(running, scheduled, done), edit=edit)
+
+
+async def _compose_prompt(event, admin_id: int, audience: str, file_id: int | None = None,
+                          page: int = 0, edit: bool = True) -> None:
+    ctx = {"audience": audience}
+    if file_id:
+        ctx["file_id"] = file_id
+    ask(admin_id, "studio_text", **ctx)
+    target_count = len(broadcast.resolve_audience(admin_id, audience))
+    lines = [
+        "✍️ <b>ব্রডকাস্ট মেসেজ</b>",
+        "",
+        f"🎯 অডিয়েন্স: <b>{broadcast.audience_label(audience)}</b> (~{target_count} জন)",
+    ]
+    if file_id:
+        row = db.file(file_id)
+        lines.append(f"🎬 ফাইল: <b>{esc(row['name']) if row else '?'}</b>")
+    else:
+        lines.append("🎬 ফাইল ছাড়া শুধু টেক্সটও চলবে।")
+    lines += [
+        "",
+        "নিচের মেসেজটি কপি করে এখানে পাঠান 👇 (সময় লিখলে শেষে <code>{name}</code> দিলে "
+        "ইউজারের নাম বসে যাবে)",
+    ]
+    await ui.render(event, "\n".join(lines), [
+        [Button.inline("🎬 ফাইল/ভিডিও বেছে নিন", f"nbcfile:{audience}:{page}")],
+        [Button.inline("🔙 বাতিল", "adm:bc")],
+    ], edit=edit)
+
+
+@route("nbcnew")
+async def studio_new(event, _rest: str) -> None:
+    admin_id = event.sender_id
+    if not access.is_admin(admin_id):
+        return
+    if not db.stores_admin(admin_id) and not db.all_user_ids():
+        await event.answer("এখনো কোনো ইউজার নেই — আগে ইউজার আসতে দিন।", alert=True)
+        return
+    await ui.render(event, "📢 <b>কে এই ব্রডকাস্ট পাবে?</b>",
+                    keyboards.broadcast_audience_picker(db.stores_admin(admin_id)),
+                    edit=True)
+    await event.answer()
+
+
+@route("nbca:")
+async def studio_audience(event, rest: str) -> None:
+    admin_id = event.sender_id
+    if not access.is_admin(admin_id):
+        return
+    audience = rest or "all"
+    targets = broadcast.resolve_audience(admin_id, audience)
+    if not targets:
+        await event.answer("এই অডিয়েন্সে এখন কেউ নেই।", alert=True)
+        return
+    await _compose_prompt(event, admin_id, audience, edit=True)
+    await event.answer()
+
+
+@route("nbcfile:")
+async def studio_file_picker(event, rest: str) -> None:
+    """Browse files of every store to attach one to the campaign."""
+    admin_id = event.sender_id
+    if not access.is_admin(admin_id):
+        return
+    audience, _, page_raw = rest.partition(":")
+    page = safe_int(page_raw)
+    rows: list[list[Button]] = []
+    items: list[tuple[int, str]] = []
+    for store in db.stores_admin(admin_id):
+        for file_row in db.files_of(store["id"], newest_first=True):
+            items.append((file_row["id"], f"{store['name'][:12]} · {file_row['name'][:22]}"))
+    per_page = 8
+    start = page * per_page
+    for file_id, label in items[start:start + per_page]:
+        rows.append([Button.inline(f"🎬 {label}", f"nbcfp:{audience}:{file_id}")])
+    nav = []
+    if page > 0:
+        nav.append(Button.inline("«", f"nbcfile:{audience}:{page - 1}"))
+    if start + per_page < len(items):
+        nav.append(Button.inline("»", f"nbcfile:{audience}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    if not items:
+        await event.answer("কোনো ফাইল নেই — আগে কনটেন্ট যোগ করুন।", alert=True)
+        return
+    rows.append([Button.inline("📝 শুধু টেক্সট", f"nbca:{audience}")])
+    rows.append([Button.inline("🔙 বাতিল", "adm:bc")])
+    await ui.render(event, "🎬 <b>কোন ফাইলটি ব্রডকাস্ট করবেন?</b>", rows, edit=True)
+    await event.answer()
+
+
+@route("nbcfp:")
+async def studio_file_chosen(event, rest: str) -> None:
+    admin_id = event.sender_id
+    if not access.is_admin(admin_id):
+        return
+    audience, _, file_raw = rest.partition(":")
+    file_id = safe_int(file_raw)
+    if db.file(file_id) is None:
+        await event.answer("ফাইলটি আর নেই।", alert=True)
+        return
+    await _compose_prompt(event, admin_id, audience, file_id=file_id, edit=True)
+    await event.answer()
+
+
+def _confirm_text(campaign: dict) -> str:
+    counts = db.campaign_counts(campaign["id"], sync=False)
+    lines = [
+        f"🧾 <b>ব্রডকাস্ট #{campaign['id']}</b> — প্রস্তুত",
+        "",
+        f"🎯 {broadcast.audience_label(campaign['audience'])} · 👥 <b>{counts['total']}</b> জন",
+    ]
+    if campaign["file_ids"]:
+        names = []
+        for fid in campaign["file_ids"][:3]:
+            row = db.file(fid)
+            names.append(esc(row["name"]) if row else f"#{fid}")
+        lines.append("🎬 ফাইল: " + ", ".join(names))
+    lines += ["", "📝 <b>প্রিভিউ (ইউজার যা দেখবে):</b>", "",
+              broadcast.preview(campaign), ""]
+    if campaign["status"] == "scheduled":
+        lines.append(f"📅 শিডিউল: {fmt_ts(campaign.get('scheduled_at'), '%Y-%m-%d %H:%M')}")
+    lines.append("<i>নিশ্চিত হলে 🚀 Send now চাপুন — চাইলে আগে 🧪 টেস্ট পাঠান।</i>")
+    return "\n".join(lines)
+
+
+async def _render_campaign(event, campaign_id: int, edit: bool = True) -> None:
+    campaign = db.campaign(campaign_id)
+    if campaign is None:
+        await event.answer("ক্যাম্পেইনটি নেই।", alert=True)
+        return
+    if campaign["status"] in ("draft", "scheduled"):
+        text = _confirm_text(campaign)
+    else:
+        progress = broadcast.campaign_progress(campaign_id)
+        text = (
+            f"{_campaign_icon(campaign['status'])} <b>ক্যাম্পেইন #{campaign_id}</b>\n"
+            f"🎯 {broadcast.audience_label(campaign['audience'])}\n\n"
+            f"📨 পাঠানো: <b>{progress['sent']}</b> · ⚠️ ব্যর্থ: <b>{progress['failed']}</b>\n"
+            f"🚫 ব্লক: <b>{progress['blocked']}</b> · 🕓 বাকি: <b>{progress['pending']}</b>\n"
+            f"📊 অগ্রগতি: <b>{progress['percent']}%</b> "
+            f"({'চলছে…' if progress['running'] else 'শেষ'})"
+        )
+    await ui.render(event, text, keyboards.campaign_detail(campaign), edit=edit)
+
+
+@route("nbcd:")
+async def studio_campaign(event, rest: str) -> None:
+    if not access.is_admin(event.sender_id):
+        return
+    await _render_campaign(event, safe_int(rest))
+    await event.answer()
+
+
+@route("nbclist:")
+async def studio_list(event, rest: str) -> None:
+    admin_id = event.sender_id
+    if not access.is_admin(admin_id):
+        return
+    if rest == "all":
+        rows = db.campaigns(limit=20, admin_id=admin_id)
+    else:
+        rows = db.campaigns(limit=20, status=rest, admin_id=admin_id)
+    title = {"running": "⏳ চলমান", "scheduled": "📅 শিডিউল", "done": "✅ শেষ হওয়া"}.get(rest, "📜 সব")
+    await ui.render(event, f"{title} <b>ক্যাম্পেইন</b>",
+                    keyboards.campaign_list(rows), edit=True)
+    await event.answer()
+
+
+@route("nbcgo:")
+async def studio_start(event, rest: str) -> None:
+    admin_id = event.sender_id
+    if not access.is_admin(admin_id):
+        return
+    campaign_id = safe_int(rest)
+    campaign = db.campaign(campaign_id)
+    if campaign is None:
+        await event.answer("ক্যাম্পেইনটি নেই।", alert=True)
+        return
+    if broadcast.is_running(campaign_id):
+        await event.answer("এটা এখনই চলছে।", alert=True)
+        return
+    counts = db.campaign_counts(campaign_id)
+    if not counts["pending"]:
+        db.rearm_campaign_items(campaign_id, ("failed",))
+        db.campaign_counts(campaign_id)
+    status = await event.respond(f"📢 ব্রডকাস্ট শুরু হচ্ছে… <b>{counts['total']}</b> জনকে পাঠানো হবে।")
+
+    async def progress(done: int, total: int, failed: int) -> None:
+        try:
+            await status.edit(f"📢 পাঠানো হচ্ছে… <b>{done}/{total}</b> (ব্যর্থ: {failed})")
+        except Exception:
+            pass
+
+    broadcast.start_campaign(campaign_id, progress=progress)
+    await event.answer("🚀 শুরু হয়েছে")
+    await _render_campaign(event, campaign_id, edit=False)
+
+
+@route("nbcstop:")
+async def studio_stop(event, rest: str) -> None:
+    if not access.is_admin(event.sender_id):
+        return
+    campaign_id = safe_int(rest)
+    stopped = broadcast.cancel_campaign(campaign_id)
+    await event.answer("⏹ থামানো হচ্ছে…" if stopped else "কিছু চলছিল না — বন্ধ করা হলো।",
+                       alert=True)
+    await _render_campaign(event, campaign_id, edit=True)
+
+
+@route("nbctest:")
+async def studio_test(event, rest: str) -> None:
+    admin_id = event.sender_id
+    if not access.is_admin(admin_id):
+        return
+    campaign_id = safe_int(rest)
+    result = await broadcast.test_send(campaign_id, [admin_id])
+    await event.answer("🧪 টেস্ট পাঠানো হয়েছে — দেখে নিন!" if result.get("ok")
+                       else "❌ টেস্ট পাঠানো যায়নি (সেশন/ফাইল চেক করুন)।", alert=True)
+
+
+@route("nbcwhen:")
+async def studio_schedule(event, rest: str) -> None:
+    admin_id = event.sender_id
+    if not access.is_admin(admin_id):
+        return
+    campaign_id = safe_int(rest)
+    if db.campaign(campaign_id) is None:
+        await event.answer("ক্যাম্পেইনটি নেই।", alert=True)
+        return
+    ask(admin_id, "studio_time", campaign_id=campaign_id)
+    await event.respond("📅 কখন পাঠাবেন? সময় লিখুন <b>HH:MM</b> ফরম্যাটে "
+                        "(আজকের জন্য, বাংলাদেশ সময়)।\n<i>যেমন: 21:30</i>")
+    await event.answer()
+
+
+@route("nbcagain:")
+async def studio_retry(event, rest: str) -> None:
+    if not access.is_admin(event.sender_id):
+        return
+    campaign_id = safe_int(rest)
+    rearmed = db.rearm_campaign_items(campaign_id, ("failed", "blocked"))
+    db.campaign_counts(campaign_id)
+    await event.answer(f"🔁 {rearmed} জনকে আবার পাঠানো হবে।", alert=True)
+    await _render_campaign(event, campaign_id, edit=True)
+
+
+@route("nbcdel:")
+async def studio_delete(event, rest: str) -> None:
+    if not access.is_admin(event.sender_id):
+        return
+    campaign_id = safe_int(rest)
+    db.delete_campaign(campaign_id)
+    await event.answer("🗑 মুছে ফেলা হয়েছে।", alert=True)
+    await show_studio(event, event.sender_id, edit=True)
+
+
+@route("nbcsize")
+async def studio_sizes(event, _rest: str) -> None:
+    admin_id = event.sender_id
+    if not access.is_admin(admin_id):
+        return
+    lines = ["📈 <b>অডিয়েন্স সাইজ</b>", ""]
+    for code, label in broadcast.AUDIENCE_LABELS.items():
+        lines.append(f"{label} — <b>{len(broadcast.resolve_audience(admin_id, code))}</b> জন")
+    for store in db.stores_admin(admin_id):
+        for kind, name in (("store", "সবাই"), ("sub", "সাবস্ক্রাইবার"), ("nosale", "কেনেনি")):
+            count = len(broadcast.resolve_audience(admin_id, f"{kind}:{store['id']}"))
+            lines.append(f"🏪 {esc(store['name'])} · {name} — <b>{count}</b> জন")
+    await ui.render(event, "\n".join(lines),
+                    [[Button.inline("🔙 Back", "adm:bc")]], edit=True)
+    await event.answer()
+
+
+@route("nbcsetup")
+async def studio_settings(event, _rest: str) -> None:
+    if not access.is_admin(event.sender_id):
+        return
+    text = (
+        "⚙️ <b>ব্রডকাস্ট স্পিড সেটিংস</b>\n\n"
+        f"⏱ মেসেজের মাঝে বিরতি: <b>{cfg.BROADCAST_DELAY}s</b>\n"
+        f"🔁 ব্যাচ: <b>{cfg.BROADCAST_BATCH}</b> মেসেজ পরপর → তারপর "
+        f"<b>{cfg.BROADCAST_BATCH_PAUSE}s</b> বিশ্রাম\n"
+        f"🎬 এক মেসেজে সর্বোচ্চ ফাইল: <b>{cfg.BROADCAST_MAX_FILES}</b>\n"
+        f"♻️ রিস্টার্টের পর অটো-রিজিউম: <b>{'চালু' if cfg.BROADCAST_AUTO_RESUME else 'বন্ধ'}</b>\n\n"
+        "<i>এই মানগুলো হোস্টিং প্যানেলের Environment Variables থেকে বদলানো যায় "
+        "(BROADCAST_DELAY, BROADCAST_BATCH, BROADCAST_BATCH_PAUSE)।</i>"
+    )
+    await ui.render(event, text, [[Button.inline("🔙 Back", "adm:bc")]], edit=True)
+    await event.answer()

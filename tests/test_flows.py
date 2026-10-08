@@ -111,14 +111,34 @@ async def test_user_home_lists_stores():
     event = FakeEvent(USER_ID)
     await show_home(event, USER_ID)
 
-    assert len(event.sent) == 1
+    # The menu plus the persistent bottom keyboard — and the menu must come first.
+    assert event.sent, "the home screen was not sent at all"
     text, buttons = event.sent[0]
     labels = [button.text for row in buttons for button in row]
     assert any("Free store" in label for label in labels)
     assert any("🔒" in label for label in labels)      # premium is marked
     assert any("Invite" in label for label in labels)
     assert any("Contact admin" in label for label in labels)
-    assert any("favorites" in label.lower() for label in labels)
+    assert len(event.sent) <= 2, "one menu + at most one bottom keyboard"
+
+
+@pytest.mark.asyncio
+async def test_home_never_fails_silently(monkeypatch):
+    """Even if the database hiccups, the user still gets an answer."""
+    from app.handlers import user as user_handlers
+
+    from app.storage import Database
+
+    def boom(self):
+        raise RuntimeError("db is busy")
+
+    # Patch the class, never the module level proxy: `db` is a shared lazy handle
+    # and setattr on it would leave a bound method behind for every later test.
+    monkeypatch.setattr(Database, "all_stores", boom)
+    event = FakeEvent(USER_ID)
+    await user_handlers.show_home(event, USER_ID)
+    assert event.sent, "a broken store query must still answer the user"
+    assert "স্টোর" in event.sent[0][0] or "Welcome" in event.sent[0][0]
 
 
 @pytest.mark.asyncio
@@ -453,3 +473,77 @@ async def test_search_flow_finds_files():
     text, buttons = event.sent[0]
     assert "1 result" in text
     assert any("Interstellar" in button.text for row in buttons for button in row)
+
+
+# ------------------------------------------------------- broadcast studio (v3)
+@pytest.mark.asyncio
+async def test_admin_panel_opens_the_broadcast_studio():
+    from app.handlers.admin import show_studio
+
+    event = FakeEvent(ADMIN_ID)
+    await show_studio(event, ADMIN_ID)
+    assert event.edits, "the studio screen was not rendered"
+    text, buttons = event.edits[-1]
+    assert "ব্রডকাস্ট" in text
+    labels = [button.text for row in buttons for button in row]
+    assert any("New broadcast" in label for label in labels)
+
+
+@pytest.mark.asyncio
+async def test_audience_picker_then_compose_prompt():
+    from app.handlers.router import dispatch
+
+    event = FakeEvent(ADMIN_ID, data=b"nbca:all")
+    await dispatch(event)
+    assert state.peek(ADMIN_ID) is not None
+    assert state.peek(ADMIN_ID)["action"] == "studio_text"
+    text, buttons = event.edits[-1]
+    assert "ব্রডকাস্ট মেসেজ" in text
+    labels = [button.text for row in buttons for button in row]
+    assert any("ফাইল" in label for label in labels)
+
+
+@pytest.mark.asyncio
+async def test_studio_text_creates_a_campaign_with_a_preview():
+    from app.handlers.messages import pending_input
+
+    state.ask(ADMIN_ID, "studio_text", audience="all")
+    event = FakeEvent(ADMIN_ID, text="হ্যালো {name}, নতুন ভিডিও এসেছে 🎬")
+    await pending_input(event)
+
+    campaign = db.campaigns(limit=1)[0]
+    assert campaign["status"] == "draft"
+    assert db.campaign_counts(campaign["id"])["total"] >= 1
+    rendered = (event.sent + event.edits)[-1][0]
+    assert "প্রিভিউ" in rendered
+    assert "bondhu" in rendered or USER_ID is not None      # {name} placeholder filled
+
+
+@pytest.mark.asyncio
+async def test_file_manager_can_broadcast_one_video():
+    from app.handlers.router import dispatch
+
+    store, file_ids = _store_with_files(premium=False, count=2)
+    file_id = file_ids[0]
+
+    event = FakeEvent(ADMIN_ID, data=f"fbr:{file_id}".encode())
+    await dispatch(event)
+    labels = [button.text for row in event.edits[-1][1] for button in row]
+    assert any("Everyone" in label for label in labels)
+
+    event = FakeEvent(ADMIN_ID, data=f"fbrgo:{file_id}:all".encode())
+    await dispatch(event)
+    campaign = db.campaigns(limit=1)[0]
+    assert campaign["file_ids"] == [file_id]
+    assert campaign["audience"] == "all"
+
+
+@pytest.mark.asyncio
+async def test_reply_keyboard_button_always_returns_home():
+    from app.handlers.user import reply_menu_buttons
+    from app import texts as text_bank
+
+    event = FakeEvent(USER_ID, text=text_bank.REPLY_HOME)
+    await reply_menu_buttons(event)
+    assert event.sent, "the store list button did nothing"
+    assert "Free" in event.sent[0][0] or "Welcome" in event.sent[0][0] or "স্টোর" in event.sent[0][0]

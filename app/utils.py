@@ -5,6 +5,7 @@ import html
 import re
 import secrets
 import time
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Iterator, Sequence, TypeVar
 
@@ -74,9 +75,24 @@ def esc(value: object) -> str:
     return html.escape(str(value if value is not None else ""))
 
 
-def slugify(name: str, max_len: int = 20) -> str:
-    base = re.sub(r"[^a-zA-Z0-9]+", "_", name or "").strip("_").lower() or "store"
-    return base[:max_len]
+def slugify(name: str, max_len: int = 24) -> str:
+    """URL slug that also works for Bengali (and any Unicode) store names.
+
+    Old versions kept only `[a-zA-Z0-9]`, so every Bangla store ended up with the
+    same useless slug ("store", "store_2", …) and its public link looked broken.
+    """
+    def keep(ch: str) -> str:
+        if ch.isalnum():
+            return ch
+        # Bangla vowel signs / hasanta are combining marks, not "alnum" — they
+        # belong to the word, otherwise "সিনেমা" would become "স_ন_ম".
+        if unicodedata.category(ch) in ("Mn", "Mc"):
+            return ch
+        return "_"
+
+    cleaned = "".join(keep(ch) for ch in unicodedata.normalize("NFC", name or ""))
+    base = re.sub(r"_{2,}", "_", cleaned).strip("_").lower()
+    return base[:max_len] or "store"
 
 
 def new_token(length: int = 10) -> str:

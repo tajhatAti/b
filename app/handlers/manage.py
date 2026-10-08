@@ -14,7 +14,7 @@ from app.handlers.router import route
 from app.handlers.state import ask, dialog_cache, flow, link_gen
 from app.logger import log
 from app.runtime import spawn
-from app.services import access, billing, scanner
+from app.services import access, billing, broadcast, scanner
 from app.storage import db
 from app.utils import esc, fmt_ts, safe_int
 
@@ -652,3 +652,61 @@ async def bulk_grant_start(event, rest: str) -> None:
         "Then you'll pick duration for all of them."
     )
     await event.answer()
+
+
+# =============================================== per-file broadcast (v2.3)
+# “প্রত্যেকটা ভিডিওর ক্ষেত্রে ব্রডকাস্টিং” — every file row has a 📢 button, and
+# each campaign keeps its own queue, so a video can be pushed again any time.
+@route("fbr:")
+async def file_broadcast(event, rest: str) -> None:
+    admin_id = event.sender_id
+    if not access.is_admin(admin_id):
+        return
+    file_row = db.file(safe_int(rest))
+    if file_row is None:
+        await event.answer("ফাইলটি আর নেই।", alert=True)
+        return
+    store = db.store(file_row["store_id"])
+    text = (f"📢 <b>Broadcast: {esc(file_row['name'])}</b>\n"
+            f"🏪 {esc(store['name']) if store else '?'} · 👁 {file_row['views']} views\n\n"
+            "এই ভিডিওটি কারা পাবে?")
+    await ui.render(event, text,
+                    keyboards.file_broadcast_picker(file_row["id"], db.stores_admin(admin_id)),
+                    edit=True)
+    await event.answer()
+
+
+@route("fbrgo:")
+async def file_broadcast_go(event, rest: str) -> None:
+    """Create the campaign for one file and show the usual confirm screen."""
+    admin_id = event.sender_id
+    if not access.is_admin(admin_id):
+        return
+    parts = rest.split(":")
+    file_id = safe_int(parts[0])
+    audience = ":".join(parts[1:]) if len(parts) > 1 else "all"
+    if db.file(file_id) is None:
+        await event.answer("ফাইলটি আর নেই।", alert=True)
+        return
+    targets = broadcast.resolve_audience(admin_id, audience)
+    if not targets:
+        await event.answer("এই অডিয়েন্সে এখন কেউ নেই।", alert=True)
+        return
+    campaign = broadcast.create_campaign(
+        admin_id, text="", title=db.file(file_id)["name"][:40],
+        audience=audience, files=[file_id], start=False,
+    )
+    from app.handlers.admin import _render_campaign
+    await _render_campaign(event, campaign["id"], edit=True)
+    await event.answer("✅ ক্যাম্পেইন তৈরি — নিশ্চিত করুন")
+
+
+@route("fbrtest:")
+async def file_broadcast_test(event, rest: str) -> None:
+    admin_id = event.sender_id
+    if not access.is_admin(admin_id):
+        return
+    from app.services.sender import deliver_file_id
+    result = await deliver_file_id(admin_id, safe_int(rest))
+    await event.answer("🧪 পাঠানো হয়েছে!" if result.ok
+                       else f"❌ পাঠানো যায়নি ({result.reason})", alert=True)

@@ -161,6 +161,31 @@ async def session_watchdog() -> None:
         await asyncio.sleep(120)
 
 
+async def campaign_loop() -> None:
+    """Broadcast studio worker.
+
+    * launches campaigns whose scheduled time has arrived,
+    * resumes campaigns that were interrupted by a restart (queue is in SQLite),
+    * never starts anything while the bot is offline — it just waits.
+    """
+    from app import runtime
+    from app.services import broadcast
+
+    while True:
+        try:
+            if runtime.bot_online():
+                if cfg.BROADCAST_AUTO_RESUME:
+                    broadcast.resume_unfinished()
+                for campaign in db.due_campaigns():
+                    if broadcast.is_running(campaign["id"]):
+                        continue
+                    log.info("Scheduled campaign #%s is due — starting", campaign["id"])
+                    broadcast.start_campaign(campaign["id"])
+        except Exception as exc:  # never let a worker die
+            log.error("campaign loop error: %s", exc)
+        await asyncio.sleep(20)
+
+
 async def _notify_admin(admin_id: int, text: str) -> None:
     try:
         await safe_call(bot.send_message, admin_id, text, what="admin_notice",
@@ -177,6 +202,7 @@ def start_all() -> list[asyncio.Task]:
         spawn(backup_loop()),
         spawn(reminder_loop()),
         spawn(session_watchdog()),
+        spawn(campaign_loop()),
     ]
     log.info("Started %s background workers", len(tasks))
     return tasks
