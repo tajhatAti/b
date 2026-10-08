@@ -7,7 +7,7 @@ import time
 from telethon import events
 from telethon.tl.custom import Button
 
-from app import i18n, keyboards, runtime, texts, ui
+from app import config as cfg, i18n, keyboards, runtime, texts, ui
 from app.handlers.router import route
 from app.handlers.state import search_pending
 from app.logger import log

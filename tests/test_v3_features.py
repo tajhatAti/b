@@ -889,3 +889,86 @@ async def test_broadcast_explains_why_someone_was_missed(clean, monkeypatch):
     breakdown = broadcast.failure_breakdown(campaign["id"])
     hints = " ".join(group["hint"] for group in breakdown)
     assert "পৌঁছানো যায় না" in hints and "ব্লক" in hints
+
+
+# ------------------------------------------------------- entry points stay sane
+def test_entry_points_can_reach_the_scheduler():
+    """Regression: `bot.py` called `scheduler.start_all()` without importing it,
+    so the deployed bot crashed with `NameError` right after connecting."""
+    import bot as bot_entry
+    from app.services import scheduler
+
+    assert bot_entry.scheduler is scheduler
+    # …and the function it calls really exists.
+    assert callable(scheduler.start_all)
+    assert callable(scheduler.run_digest)
+
+
+# ------------------------------------------------- screens must render (no NameError)
+@pytest.mark.asyncio
+async def test_payment_settings_screen_renders(clean):
+    """Regression: `settings.get(k)` inside a comprehension crashed the whole
+    💳 Payment settings screen in the bot with `NameError: name 'k'`."""
+    from app.handlers import billing as billing_handlers
+    from tests.test_flows import FakeEvent
+
+    event = FakeEvent(ADMIN_ID)
+    await billing_handlers.payment_settings(event, "")
+    assert event.edits, "screen never rendered"
+    text, buttons = event.edits[-1]
+    assert "পেমেন্ট" in text
+    assert any("bKash" in row[0].text for row in buttons if row)
+
+
+# ------------------------------------------------------ scheduler / digest / cache
+@pytest.mark.asyncio
+async def test_digest_queues_a_campaign_with_the_weeks_new_videos(clean):
+    from app.services import settings, scheduler
+    store, file_id = _store_with_video()
+    for user_id in (901, 902):
+        db.touch_user(user_id, f"U{user_id}")
+    settings.set("DIGEST_MAX_FILES", 2)
+    # store:1 audience needs a *reason* to include people — a free store is open
+    db.update_store(store["id"], is_premium=0)
+
+    report = await scheduler.run_digest(force=True)
+    assert report["ok"] and report["queued"]
+    entry = report["queued"][0]
+    assert entry["store"] == "Movies"
+    assert entry["files"] == 1                      # only the fresh video
+    campaign = db.campaign(entry["campaign"])
+    assert campaign is not None
+    assert campaign["status"] in ("queued", "running", "done")
+    assert campaign["file_ids"] == [file_id]        # newest_first really works
+    settings.reset("DIGEST_MAX_FILES")
+
+
+def test_scheduler_starts_every_worker(clean):
+    import asyncio
+    from app.services import scheduler
+
+    async def run():
+        tasks = scheduler.start_all()
+        assert len(tasks) == 8
+        assert all(isinstance(t, asyncio.Task) for t in tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+def test_duplicate_cleaner_removes_only_the_extras(clean):
+    store, file_id = _store_with_video()
+    # A duplicate rows can only exist from an older version / manual import, so
+    # create one straight in the table the way the old buggy code did.
+    db._run(
+        "INSERT INTO files(store_id, name, kind, chat_id, msg_id, created_at, views) "
+        "VALUES(?, ?, ?, ?, ?, ?, 0)",
+        (store["id"], "Movie 1 copy", "Video", -100, 10, time.time()))
+    assert len(db.duplicate_files()) == 1
+    removed = db.purge_duplicate_files()
+    assert removed == 1
+    assert db.duplicate_files() == []
+    assert len(db.files_of(store["id"])) == 1
+    assert db.file(file_id) is not None             # the original stays

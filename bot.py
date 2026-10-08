@@ -13,7 +13,7 @@ from telethon.sessions import StringSession
 
 from app import config as cfg, runtime
 from app.logger import log, setup_logging
-from app.services import secrets_guard
+from app.services import scheduler, secrets_guard
 from app.storage import db
 
 
