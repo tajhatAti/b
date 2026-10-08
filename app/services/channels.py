@@ -228,6 +228,48 @@ async def postable_channels() -> list[dict]:
     return out
 
 
+async def auto_post_new_file(file_id: int, store_id: int | None = None) -> dict:
+    """Publish a newly added file to the configured channel automatically.
+
+    This is the “ভিডিও যোগ করলেই চ্যানেলে পোস্ট” flow: the admin sends a video to
+    the bot, it gets mirrored, and the channel gets a message with the online
+    button — optionally as a **limited link** instead of the media itself.
+    """
+    from app import runtime
+    from app.services import settings
+
+    if not settings.get_bool("AUTO_POST_ENABLED", False):
+        return {"ok": False, "error": "off"}
+    file_row = db.file(file_id)
+    if file_row is None:
+        return {"ok": False, "error": "file missing"}
+    store_id = store_id or file_row["store_id"]
+    store = db.store(store_id)
+    target = (settings.get_str("AUTO_POST_CHANNEL") or "").strip()
+    if not target:
+        rows = db.join_channels()
+        if not rows:
+            return {"ok": False, "error": "কোনো চ্যানেল যোগ করা নেই"}
+        target = rows[0].get("chat_id") or rows[0]["ref"]
+    template = settings.get_str("AUTO_POST_TEXT") or "{name}"
+    text = template.replace("{name}", file_row["name"])
+    buttons = []
+    username = runtime.bot_username or ""
+    if store and username:
+        buttons.append(f"🟢 {store['name'][:30]} খুলুন | "
+                       f"https://t.me/{username}?start={store['slug']}")
+    default = settings.get_str("BROADCAST_DEFAULT_BUTTONS")
+    if default:
+        buttons.append(default)
+    limit = settings.get_int("AUTO_POST_LINK_LIMIT", 0)
+    result = await publish(target, text=text, file_ids=[file_id],
+                           buttons="\n".join(buttons), store_id=store_id,
+                           link_limit=limit if limit > 0 else -1)
+    db.log_event("auto_post", None, store_id, file_id, str(target),
+                 "ok" if result.get("ok") else str(result.get("error"))[:120])
+    return result
+
+
 def composer_defaults(store_id: int | None = None) -> dict:
     """Text + buttons a fresh channel post starts with (editable in the panel)."""
     store = db.store(store_id) if store_id else None

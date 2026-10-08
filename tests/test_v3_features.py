@@ -795,3 +795,97 @@ def test_gate_text_escapes_channel_titles_but_keeps_html():
     assert "&lt;b&gt;bad&lt;/b&gt;" in text                       # user data escaped
     again = forcejoin.gate_text([{"title": "T", "ref": "@x"}], "again")
     assert "এখনো জয়েন করেননি" in again
+
+
+# ===================================================== broadcast: real delivery
+class MediaClient:
+    """Offline stand-in for the bot used by the delivery path."""
+
+    def __init__(self, blocked: set[int] | None = None) -> None:
+        self.blocked = blocked or set()
+        self.media_sent: list[tuple[int, object]] = []
+        self.texts: list[tuple[int, str]] = []
+        self.parse_mode = "html"
+
+    async def get_messages(self, source=None, ids=None, **_kw):
+        return SimpleNamespace(media="<media>", id=ids)
+
+    async def get_input_entity(self, entity):
+        return entity
+
+    async def send_message(self, chat_id, text=None, **_kw):
+        if chat_id in self.blocked:
+            raise RuntimeError("Forbidden: bot was blocked by the user")
+        self.texts.append((chat_id, text))
+        return SimpleNamespace(id=len(self.texts))
+
+    async def __call__(self, _request):
+        return True
+
+
+@pytest.mark.asyncio
+async def test_media_broadcast_really_reaches_users(clean, monkeypatch):
+    """The exact complaint: “only my test message arrives, nobody else gets it”.
+
+    A media campaign must go out as the **bot** (mirror → plain send) for every
+    user, and everyone who cannot be reached must show up with a reason.
+    """
+    from app.services import broadcast, sender
+    store, file_id = _store_with_video()
+    db.set_mirror(file_id, 999000, 42)                      # pre-warmed copy
+    for user_id in (701, 702, 703):
+        db.touch_user(user_id, f"বন্ধু{user_id}")
+
+    client = MediaClient(blocked={702})
+    monkeypatch.setattr(runtime, "_client", client)
+
+    async def fake_media(chat_id, media, caption_text, buttons=None):
+        if chat_id in client.blocked:
+            raise RuntimeError("Forbidden: bot was blocked by the user")
+        client.media_sent.append((chat_id, media))
+
+    monkeypatch.setattr(sender, "_send_media", fake_media)
+    monkeypatch.setattr(cfg, "BROADCAST_DELAY", 0)
+    monkeypatch.setattr(cfg, "BROADCAST_BATCH", 0)
+
+    admin_id = 999
+    db.touch_user(admin_id, "Admin", "admin")
+    campaign = broadcast.create_campaign(admin_id, text="নতুন ভিডিও!",
+                                         audience="all", files=[file_id], start=False)
+    result = await broadcast.run_campaign(campaign["id"])
+
+    delivered = {chat for chat, _ in client.media_sent}
+    assert {701, 703, USER_ID} <= delivered, delivered
+    assert 702 not in delivered                       # blocked → skipped
+    assert result["status"] == "done" and result["sent"] >= 3
+    rows = {item["user_id"]: item for item in db.campaign_items(campaign["id"], limit=999)}
+    assert rows[702]["status"] == "blocked"
+    hint = broadcast.explain_error(rows[702]["error"])
+    assert "ব্লক" in hint
+    assert "blocked" not in hint.lower()              # explained in the admin's own words
+
+
+@pytest.mark.asyncio
+async def test_broadcast_explains_why_someone_was_missed(clean, monkeypatch):
+    from app.services import broadcast, sender
+    store, file_id = _store_with_video()
+    db.set_mirror(file_id, 999000, 43)
+    for user_id, reason in ((801, "Cannot find any entity corresponding to 801"),
+                            (802, "Forbidden: bot was blocked by the user")):
+        db.touch_user(user_id, f"U{user_id}")
+
+    client = MediaClient()
+    monkeypatch.setattr(runtime, "_client", client)
+
+    async def fake_media(chat_id, media, caption_text, buttons=None):
+        if chat_id in (801, 802):
+            raise RuntimeError(dict(((801, "Cannot find any entity corresponding to 801"),
+                                     (802, "Forbidden: bot was blocked by the user")))[chat_id])
+
+    monkeypatch.setattr(sender, "_send_media", fake_media)
+    campaign = broadcast.create_campaign(999, text="x", audience="all",
+                                         files=[file_id], start=False)
+    await broadcast.run_campaign(campaign["id"])
+    breakdown = broadcast.failure_breakdown(campaign["id"])
+    hints = " ".join(group["hint"] for group in breakdown)
+    assert "পৌঁছানো যায় না" in hints and "ব্লক" in hints

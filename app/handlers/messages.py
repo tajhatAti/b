@@ -216,7 +216,13 @@ async def _text_guard_reply(event, reason: str) -> None:
 
 
 async def mirror_soon(file_id: int) -> None:
-    """Prepare the bot-side copy of a freshly added file (background)."""
+    """Prepare the bot-side copy of a freshly added file (background).
+
+    After the copy exists, the optional “auto-post to channel” step runs — the
+    channel gets a message (or a limited link) with the online button. Everything
+    is background work: the admin's upload never waits on it.
+    """
+    from app.services import channels as channels_service
     from app.services.sender import ensure_ready
     row = db.file(file_id)
     if row is None:
@@ -227,6 +233,12 @@ async def mirror_soon(file_id: int) -> None:
             db.log_event("mirror_ok", None, row["store_id"], file_id, "auto")
     except Exception as exc:
         log.debug("background mirror failed for %s: %s", file_id, exc)
+    try:
+        result = await channels_service.auto_post_new_file(file_id, row["store_id"])
+        if result.get("ok"):
+            db.log_event("auto_post_ok", None, row["store_id"], file_id, "channel")
+    except Exception as exc:
+        log.debug("auto channel post skipped for %s: %s", file_id, exc)
 
 
 # --------------------------------------------------------------- search input

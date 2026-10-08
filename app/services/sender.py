@@ -25,6 +25,24 @@ from app.storage import db
 from app.services.telegram import safe_call
 
 OK, NOT_FOUND, NO_SESSION, FLOOD, ERROR = "ok", "not_found", "no_session", "flood", "error"
+BLOCKED, MISSING = "blocked", "missing"
+
+#: Telegram error fragments that mean “this user can never be reached”.
+BLOCKED_HINTS = ("blocked by the user", "user is deactivated", "bot was kicked",
+                 "chat not found", "peer id invalid", "cannot find any entity",
+                 "bot can't initiate conversation")
+
+
+def classify_failure(detail: str) -> str:
+    """Map a raw Telegram error onto a reason the broadcast queue understands."""
+    low = (detail or "").lower()
+    if "flood" in low or "too many requests" in low:
+        return FLOOD
+    if any(hint in low for hint in BLOCKED_HINTS):
+        return BLOCKED
+    if "not found" in low or "deleted" in low:
+        return MISSING
+    return ERROR
 
 
 @dataclass
@@ -78,14 +96,19 @@ async def _send_media(chat_id: int, media, caption_text: str, buttons=None) -> N
     )
 
 
-async def _try_direct(file_row: dict, chat_id: int, caption_text: str, buttons=None) -> bool:
+async def _try_direct(file_row: dict, chat_id: int, caption_text: str,
+                      buttons=None) -> tuple[bool, str]:
     """Bot-side send. Tries the mirror (best) and then the original location.
 
     Reading the mirror first is what makes a broadcast to thousands of users
     cheap: one message, thousands of plain sends, zero userbot traffic.
+
+    Returns `(sent, last_error)` — the error text is what lets a broadcast tell
+    “blocked by the user” apart from “file is gone” afterwards.
     """
     from app.services.media_cache import mirror_targets
 
+    last_error = ""
     for source_chat, source_msg in mirror_targets(file_row):
         if not source_msg:
             continue
@@ -93,23 +116,29 @@ async def _try_direct(file_row: dict, chat_id: int, caption_text: str, buttons=N
             msg = await safe_call(bot.get_messages, source_chat, ids=source_msg,
                                   what="get_messages", retries=1)
         except Exception as exc:
+            last_error = str(exc)[:200]
             log.debug("direct fetch failed for file %s at %s/%s: %s",
                       file_row["id"], source_chat, source_msg, exc)
             continue
         if not msg or not getattr(msg, "media", None):
             if file_row.get("mirror_msg") and int(source_chat) == int(file_row.get("mirror_chat") or 0):
                 db.clear_mirror(file_row["id"])       # mirror is gone — re-create later
+            last_error = last_error or "media not available"
             continue
         try:
             await _send_media(chat_id, msg.media, caption_text, buttons)
         except FloodWaitError:
             raise
         except Exception as exc:
+            last_error = str(exc)[:200]
+            if classify_failure(last_error) == BLOCKED:
+                # No point walking the other sources: the *user* is unreachable.
+                return False, last_error
             log.debug("send of %s to %s failed: %s", file_row["id"], chat_id, exc)
             continue
         db.bump_views(file_row["id"])
-        return True
-    return False
+        return True, ""
+    return False, last_error
 
 
 async def ensure_ready(file_row: dict) -> dict:
@@ -250,34 +279,50 @@ async def deliver(chat_id: int, file_row: dict, caption_text: str | None = None,
         caption_text = runtime.caption()
     caption = caption_text or ""
 
+    last_error = ""
     try:
-        if await _try_direct(file_row, chat_id, caption, buttons):
+        sent, last_error = await _try_direct(file_row, chat_id, caption, buttons)
+        if sent:
             return Delivery(True)
+        if classify_failure(last_error) == BLOCKED:
+            return Delivery(False, BLOCKED, last_error)
     except FloodWaitError:
         return Delivery(False, FLOOD)
     except Exception as exc:
+        last_error = str(exc)[:200]
         log.debug("direct send failed for file %s: %s", file_row["id"], exc)
 
     # Not readable yet — create the mirror once, then send from it.
     try:
         updated = await ensure_ready(file_row)
-        if updated.get("mirror_msg") and await _try_direct(updated, chat_id, caption, buttons):
-            return Delivery(True)
+        if updated.get("mirror_msg"):
+            sent, error = await _try_direct(updated, chat_id, caption, buttons)
+            if sent:
+                return Delivery(True)
+            last_error = error or last_error
+            if classify_failure(last_error) == BLOCKED:
+                return Delivery(False, BLOCKED, last_error)
     except FloodWaitError:
         return Delivery(False, FLOOD)
     except Exception as exc:
+        last_error = str(exc)[:200]
         log.debug("mirror path failed for file %s: %s", file_row["id"], exc)
 
     result = await _try_jit(file_row, chat_id, caption, buttons)
-    if result.ok or result.reason in (NOT_FOUND, NO_SESSION, FLOOD):
+    if result.ok or result.reason in (NOT_FOUND, NO_SESSION, FLOOD, BLOCKED):
         return result
     # Retry the direct path once more: the userbot may have just pulled the file
     # into the bot's reach (e.g. right after the session reconnected).
     try:
-        if await _try_direct(file_row, chat_id, caption, buttons):
+        sent, error = await _try_direct(file_row, chat_id, caption, buttons)
+        if sent:
             return Delivery(True)
+        if error:
+            result.detail = f"{result.detail} | {error}".strip(" |")
     except Exception:
         pass
+    if not result.detail and last_error:
+        result.detail = last_error
     return result
 
 

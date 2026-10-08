@@ -558,9 +558,37 @@ def create_app() -> FastAPI:
         note = f'<div class="flash">{esc(flash)}</div>' if flash else ""
         warnbox = f'<div class="warnbox">{esc(warn)}</div>' if warn else ""
         items = db.campaign_items(campaign_id, limit=200)
-        sample = "".join(
-            f"<tr><td>{item['user_id']}</td><td>{item['status']}</td>"
-            f"<td class='muted'>{esc(item['error'] or '')[:60]}</td></tr>" for item in items[:60])
+        sample_rows = []
+        for item in items[:60]:
+            user = db.user(item["user_id"]) or {}
+            who = esc(user.get("name") or "") or "—"
+            if user.get("username"):
+                who += f" <span class='muted'>@{esc(user['username'])}</span>"
+            flag = {"sent": "✅", "pending": "⏳", "blocked": "🚫",
+                    "failed": "⚠️"}.get(item["status"], "•")
+            note = broadcast.explain_error(item["error"]) if item["error"] else ""
+            sample_rows.append(
+                f"<tr><td><a href='/admin/users/{item['user_id']}'>{item['user_id']}</a><br>"
+                f"<span class='muted'>{who}</span></td>"
+                f"<td>{flag} {esc(item['status'])}</td><td class='muted'>{esc(note)}</td></tr>")
+        sample = "".join(sample_rows)
+
+        # “Why did only the test message arrive?” — answered right on this page.
+        reasons = broadcast.failure_breakdown(campaign_id)
+        reason_html = "".join(
+            f"<li><b>{esc(group['hint'])}</b> — {group['count']} জন "
+            f"<span class='muted'>({', '.join(str(u) for u in group['users'])}…)</span></li>"
+            for group in reasons)
+        why = (f"<div class='card'><h4>❓ কেন সবাই পায়নি</h4><ul>{reason_html}</ul>"
+               f"<p class='muted'>একই কারণে আটকে থাকা সবাইকে এক ক্লিকে আবার পাঠাতে "
+               f"🔁 Retry failed চাপুন। ইউজার বটকে ব্লক করলে সেটা টেলিগ্রামের নিয়ম — "
+               f"শুধু বট-ই মেসেজ পাঠাতে পারে না, কোনো উপায় নেই।</p></div>") if reasons else ""
+        missing_media = [fid for fid in (campaign.get("file_ids") or [])
+                         if not (db.file(fid) or {}).get("mirror_msg")]
+        cache_warn = (f"<div class='warnbox'>🎞 {len(missing_media)} টি ফাইলের বট-কপি এখনো "
+                      f"তৈরি হয়নি — প্রথম পাঠানোর সময় তৈরি হবে (একটু ধীর লাগতে পারে)। "
+                      f"আগেই সবার জন্য তৈরি করতে <a href='/admin/files'>📥 ফাইল পেজ</a> থেকে "
+                      f"“সব ফাইল ক্যাশ করুন” চাপুন।</div>") if missing_media else ""
         body = f"""
         {note}{warnbox}
         <h3>📢 ক্যাম্পেইন #{campaign_id}</h3>
@@ -581,8 +609,9 @@ def create_app() -> FastAPI:
           <form method=post action="/admin/broadcast/{campaign_id}/test"><button class="grey">🧪 Test to me</button></form>
           <form method=post action="/admin/broadcast/{campaign_id}/delete"><button class="bad">🗑 Delete</button></form>
         </div>
-        <h4>Queue (first 60)</h4>
-        <table><tr><th>User</th><th>Status</th><th>Note</th></tr>{sample or "<tr><td colspan=3 class=muted>খালি</td></tr>"}</table>
+        {cache_warn}{why}
+        <h4>কিউ (প্রথম ৬০ জন) — কে পেল, কে পেল না</h4>
+        <table><tr><th>ইউজার</th><th>অবস্থা</th><th>কারণ / নোট</th></tr>{sample or "<tr><td colspan=3 class=muted>খালি</td></tr>"}</table>
         <script>
           const bar = document.querySelector('.bar > i');
           async function tick() {{

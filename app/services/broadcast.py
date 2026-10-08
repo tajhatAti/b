@@ -232,7 +232,9 @@ async def _send_to_user(campaign: dict, user_id: int) -> str:
                 raise RuntimeError("ফাইলটি মুছে ফেলা হয়েছে")
             probe = await deliver_file_id(user_id, chosen[0], body, buttons=buttons)
             if not probe.ok:
-                raise RuntimeError(f"media unavailable ({probe.reason}): {probe.detail}")
+                # `blocked` here means the *recipient* is unreachable, not that the
+                # file is broken — keep the real wording so the queue explains it.
+                raise RuntimeError(f"{probe.reason}: {probe.detail or 'media unavailable'}")
 
         sent = 0
         for index, file_id in enumerate(chosen):
@@ -241,7 +243,7 @@ async def _send_to_user(campaign: dict, user_id: int) -> str:
             if not result.ok:
                 if sent:
                     break                     # partial send: don't mark as failed
-                raise RuntimeError(f"file {file_id}: {result.reason}")
+                raise RuntimeError(f"file {file_id}: {result.reason}: {result.detail}")
             sent += 1
             if index + 1 < len(chosen):
                 await asyncio.sleep(settings.get_float("BROADCAST_MEDIA_DELAY", 1.0))
@@ -254,6 +256,53 @@ async def _send_to_user(campaign: dict, user_id: int) -> str:
     if message is None:
         raise RuntimeError("send returned nothing")
     return "sent"
+
+
+#: Telegram says “no” in a dozen different flavours; the admin only wants to know
+#: *why* the message did not reach a person — and whether retrying helps.
+#: Order matters: the most specific wording wins. (“cannot find any entity”
+#: happens for people who never pressed /start — a different problem from a block.)
+ERROR_HINTS = (
+    ("flood", "⏳ টেলিগ্রামের সাময়িক লিমিট (FloodWait) — কিছুক্ষণ পরে 🔁 Retry চাপলেই যাবে"),
+    ("deactivated", "🪦 ইউজার অ্যাকাউন্ট ডিলিট/ডিঅ্যাক্টিভেট"),
+    ("cannot find any entity", "❓ এই আইডিতে পৌঁছানো যায় না — সাধারণত বট কখনো /start করা হয়নি"),
+    ("peer id invalid", "❓ পুরোনো/ভুল আইডি — বটের সাথে কখনো যোগাযোগ হয়নি"),
+    ("bot can't initiate conversation", "❓ বট আগে কখনো বসেনি — ইউজারকে /start দিতে বলুন"),
+    ("blocked", "🚫 ইউজার বটকে ব্লক করেছে — আর কখনো পৌঁছাবে না (তালিকা থেকে বাদ দিন)"),
+    ("user is deactivated", "🪦 অ্যাকাউন্ট ডিঅ্যাক্টিভেট"),
+    ("media unavailable", "🎞 ফাইলের বট-কপি তৈরি হয়নি — ফাইল পেজ থেকে 📥 ক্যাশ করুন"),
+    ("no_session", "🔑 কোনো ইউজারবট সেশন নেই — ফাইলটা ক্যাশ করা যাচ্ছে না"),
+    ("mirror", "🎞 মিডিয়া ক্যাশ করা যায়নি — সেশন/ক্যাশ চ্যানেল দেখুন"),
+    ("file missing", "🗂 ফাইলটি পাওয়া যাচ্ছে না — হয়তো ডিলিট হয়েছে"),
+    ("bot was kicked", "👋 বটকে চ্যাট থেকে বাদ দেওয়া হয়েছে"),
+    ("too many requests", "⏳ খুব দ্রুত পাঠানো হচ্ছে — BROADCAST_DELAY বাড়ান"),
+    ("empty message", "✍️ মেসেজ খালি — টেক্সট বা ফাইল দিন"),
+)
+
+
+def explain_error(detail: str) -> str:
+    """Turn a raw Telegram error into something actionable for the admin."""
+    text = (detail or "").strip()
+    low = text.lower()
+    for needle, hint in ERROR_HINTS:
+        if needle in low:
+            return hint
+    return f"⚠️ {text[:120]}" if text else "⚠️ অজানা কারণ"
+
+
+def failure_breakdown(campaign_id: int) -> list[dict]:
+    """Group the queue by *why* each person was missed."""
+    groups: dict[str, dict] = {}
+    for item in db.campaign_items(campaign_id, limit=100000):
+        status = item.get("status")
+        if status in ("sent", "pending"):
+            continue
+        hint = explain_error(item.get("error") or status)
+        bucket = groups.setdefault(hint, {"hint": hint, "count": 0, "users": []})
+        bucket["count"] += 1
+        if len(bucket["users"]) < 8:
+            bucket["users"].append(item.get("user_id"))
+    return sorted(groups.values(), key=lambda g: -g["count"])
 
 
 def runtime_caption() -> str:
