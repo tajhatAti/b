@@ -875,6 +875,12 @@ class Database:
     # --------------------------------------------------------------- bot chats
     def add_bot_chat(self, chat_id: int, title: str = "") -> None:
         self._run("INSERT OR IGNORE INTO bot_chats(chat_id, title) VALUES(?, ?)", (chat_id, title))
+        if title:
+            # The channel list (📡 Channels / composer dropdown) reads titles from
+            # meta, so a scanned channel shows up with its real name.
+            self.set_meta(f"chat_title:{chat_id}", title)
+            self._run("UPDATE bot_chats SET title = ? WHERE chat_id = ? AND (title IS NULL OR title = '')",
+                      (title, chat_id))
 
     def bot_chats(self) -> set[int]:
         return {r["chat_id"] for r in self._q("SELECT chat_id FROM bot_chats")}
