@@ -949,7 +949,7 @@ def test_scheduler_starts_every_worker(clean):
 
     async def run():
         tasks = scheduler.start_all()
-        assert len(tasks) == 8
+        assert len(tasks) == 9
         assert all(isinstance(t, asyncio.Task) for t in tasks)
         for task in tasks:
             task.cancel()
@@ -1024,3 +1024,58 @@ async def test_bot_link_flow_accepts_total_slash_per_user(clean, monkeypatch):
     link = db.links(limit=1)[0]
     assert link["max_clicks"] == 100 and link["per_user_limit"] == 1
     assert "একজন সর্বোচ্চ 1 বার" in event.sent[-1][0]
+
+
+@pytest.mark.asyncio
+async def test_owner_report_reads_real_numbers_and_warns(clean, monkeypatch):
+    """The daily DM: the five numbers that matter, plus what needs fixing."""
+    from app.services import scheduler
+
+    store, file_id = _store_with_video()
+    db.log_event("deliver", USER_ID, store["id"], file_id, "direct")
+    db.log_event("join_block", USER_ID, store["id"], file_id, "@chan")
+    db.log_event("limit_block", USER_ID, store["id"], file_id, "tok", "per_user=1")
+
+    sent: list[tuple[int, str]] = []
+
+    class ReportBot:
+        async def send_message(self, chat_id, text=None, **_kw):
+            sent.append((chat_id, text))
+            return True
+
+    monkeypatch.setattr(scheduler, "bot", ReportBot())
+    monkeypatch.setattr(cfg, "ADMIN_IDS", [ADMIN_ID])
+    text = await scheduler.send_owner_report()
+    assert sent and sent[0][0] == ADMIN_ID
+    assert "দৈনিক রিপোর্ট" in text
+    assert "ভিডিও পাঠানো: <b>1</b>" in text
+    assert "চ্যানেল গেটে আটকেছে" in text
+    assert "লিমিট শেষ" in text
+    assert "ইউজারবট সেশন নেই" in text                # no session → real warning
+    assert "ক্যাশ তৈরি: <b>1</b>" in text            # the mirrored file is counted
+    assert db.get_meta("owner_report_text")
+
+
+@pytest.mark.asyncio
+async def test_renewal_notice_is_bengali_by_default(clean, monkeypatch):
+    import time as _time
+    from app.services import scheduler
+
+    store, _file_id = _store_with_video()
+    db.grant(store["id"], USER_ID, _time.time() + 3600, "test")
+    sent: list[tuple[int, str]] = []
+
+    class ReminderBot:
+        async def send_message(self, chat_id, text=None, **_kw):
+            sent.append((chat_id, text))
+            return True
+
+    monkeypatch.setattr(scheduler, "bot", ReminderBot())
+    for grant in db.expired_grants(within_seconds=3 * 86400):
+        from app import i18n
+        from app.utils import esc as _esc, fmt_ts as _fmt
+        await ReminderBot().send_message(
+            grant["user_id"],
+            i18n.t(grant["user_id"], "renewal_notice", store=_esc(grant["store_name"]),
+                   date=_fmt(grant["expires_at"])))
+    assert sent and "অ্যাক্সেস" in sent[0][1]

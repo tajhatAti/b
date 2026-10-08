@@ -5,13 +5,14 @@ from __future__ import annotations
 import asyncio
 import time
 
-from app import config as cfg
+from app import config as cfg, i18n, runtime
 from app.logger import log
 from app.services import settings
 from app.runtime import (blocked_users, bot, register_client,
                          unregister_client, user_clients)
 from app.services.access import has_access
-from app.services.sender import deliver
+from app.services.billing import price_text
+from app.services.sender import deliver, mirror_ready
 from app.services.telegram import safe_call
 from app.storage import db
 from app.utils import esc, fmt_ts, local_date_str, local_time_str
@@ -116,9 +117,9 @@ async def reminder_loop() -> None:
                     try:
                         await safe_call(
                             bot.send_message, user_id,
-                            f"⏳ Your access to <b>{esc(grant['store_name'])}</b> ends on "
-                            f"{fmt_ts(grant['expires_at'])}.\n"
-                            "Message the admin to renew and keep your access.",
+                            i18n.t(user_id, "renewal_notice",
+                                   store=esc(grant["store_name"]),
+                                   date=fmt_ts(grant["expires_at"])),
                             what="renewal_notice", retries=1,
                         )
                     except Exception:
@@ -126,6 +127,75 @@ async def reminder_loop() -> None:
         except Exception as exc:
             log.error("reminder loop error: %s", exc)
         await asyncio.sleep(1800)
+
+
+async def owner_report_loop() -> None:
+    """One short DM a day telling the owner what actually happened.
+
+    Counts users, deliveries, blocks, money and the media-cache health — the five
+    numbers that decide whether the store is growing. Everything is read from the
+    `events` table, so it costs nothing to produce.
+    """
+    while True:
+        try:
+            if settings.get_bool("OWNER_REPORT_ENABLED", True):
+                today = local_date_str()
+                hour = int(local_time_str()[:2])
+                if hour >= settings.get_int("OWNER_REPORT_HOUR", 21) \
+                        and db.get_meta("owner_report_day") != today:
+                    db.set_meta("owner_report_day", today)
+                    await send_owner_report()
+        except Exception as exc:
+            log.error("owner report error: %s", exc)
+        await asyncio.sleep(1800)
+
+
+async def send_owner_report(days: int = 1) -> str:
+    """Build and send the daily digest to every admin using owner_report_loop."""
+    since = time.time() - days * 86400
+    stats = db.stats()
+    day = db.event_counts(since=since)          # {"deliver": 3, "join_block": 1, …}
+    orders = db.orders_since(since)
+    revenue = sum(float(o.get("amount") or 0) for o in orders
+                  if (o.get("status") or "") == "approved")
+    cache = mirror_ready()
+    lines = [
+        "📊 <b>দৈনিক রিপোর্ট</b>",
+        "",
+        f"👥 মোট ইউজার: <b>{stats['users']}</b> · নতুন: <b>{day.get('start', 0)}</b>",
+        f"🎬 ভিডিও পাঠানো: <b>{day.get('deliver', 0)}</b> · স্টোর খোলা: <b>{day.get('open_store', 0)}</b>",
+        f"🔐 চ্যানেল গেটে আটকেছে: <b>{day.get('join_block', 0)}</b> · "
+        f"জয়েন করেছে: <b>{day.get('join_retry', 0) + day.get('join_click', 0)}</b>",
+        f"🔗 লিমিট শেষ: <b>{day.get('limit_block', 0)}</b> · লিংক ব্যবহার: <b>{day.get('limit_use', 0)}</b>",
+        f"💳 অর্ডার: <b>{len(orders)}</b> · আয়: <b>{esc(price_text(revenue))}</b>",
+        f"📊 মোট ফাইল: <b>{stats['files']}</b> · ক্যাশ তৈরি: <b>{cache['mirrored']}</b>"
+        f" / বাকি: <b>{cache['missing']}</b>",
+    ]
+    if day.get("paid"):
+        lines.append(f"✅ আজ পেমেন্ট গৃহীত: <b>{day['paid']}</b>")
+    warnings = []
+    if cache["missing"]:
+        warnings.append(f"📥 {cache['missing']} টি ফাইলের বট-কপি এখনো তৈরি হয়নি — "
+                        f"ফাইল পেজ থেকে ক্যাশ করুন")
+    if not runtime.user_clients:
+        warnings.append("🔑 কোনো ইউজারবট সেশন নেই — প্রাইভেট চ্যানেলের ফাইল পাঠাতে পারবে না")
+    if db.count_mirrors() == 0 and stats["files"]:
+        warnings.append("🎞 মিডিয়া ক্যাশ একদম খালি — প্রথম ক্লিকগুলো ধীর হবে")
+    if warnings:
+        lines.append("")
+        lines.extend(f"⚠️ {text}" for text in warnings)
+    if day.get("empty"):
+        lines.append("")
+        lines.append("💡 আজ কেউ কিছু খোলেনি — নতুন ব্রডকাস্ট বা ডাইজেস্ট দেওয়ার ভালো সময়।")
+    text = "\n".join(lines)
+    for admin_id in cfg.ADMIN_IDS:
+        try:
+            await safe_call(bot.send_message, admin_id, text, what="owner_report",
+                            retries=1, link_preview=False)
+        except Exception:
+            continue
+    db.set_meta("owner_report_text", text[:4000])
+    return text
 
 
 async def session_watchdog() -> None:
@@ -289,6 +359,7 @@ def start_all() -> list[asyncio.Task]:
         spawn(campaign_loop()),
         spawn(mirror_loop()),
         spawn(digest_loop()),
+        spawn(owner_report_loop()),
     ]
     log.info("Started %s background workers", len(tasks))
     return tasks

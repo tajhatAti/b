@@ -1071,6 +1071,15 @@ class Database:
             (status, time.time(), admin_id, admin_note, order_id),
         )
 
+    def orders_since(self, since: float, status: str | None = None) -> list[dict]:
+        """Orders created after `since` — powers the daily owner report."""
+        sql = "SELECT * FROM orders WHERE created_at >= ?"
+        params: list[Any] = [float(since)]
+        if status:
+            sql += " AND status = ?"
+            params.append(status)
+        return [dict(r) for r in self._q(sql + " ORDER BY created_at DESC", params)]
+
     def pending_order_count(self) -> int:
         return self._one("SELECT COUNT(*) AS c FROM orders WHERE status = 'pending'")["c"]
 

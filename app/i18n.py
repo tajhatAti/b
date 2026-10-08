@@ -34,6 +34,16 @@ STRINGS: dict[str, dict[str, str]] = {
     },
     "no_results": {"bn": "❌ “{kw}” এর জন্য কিছু পাওয়া গেল না।", "en": "❌ Nothing found for “{kw}”."},
     "files_sent_ok": {"bn": "✅ পাঠানো হয়েছে!", "en": "✅ Sent!"},
+    "renewal_notice": {
+        "bn": "⏳ <b>{store}</b> স্টোরে আপনার অ্যাক্সেস {date} তারিখে শেষ হবে।\n"
+              "আরও দেখতে চাইলে এখনই বাড়িয়ে নিন — অ্যাডমিনকে মেসেজ দিন।",
+        "en": "⏳ Your access to <b>{store}</b> ends on {date}.\n"
+              "Message the admin to renew and keep watching.",
+    },
+    "expired_notice": {
+        "bn": "🔒 <b>{store}</b> স্টোরের অ্যাক্সেসের সময় শেষ। আবার নিতে অ্যাডমিনকে মেসেজ দিন।",
+        "en": "🔒 Your access to <b>{store}</b> has ended. Message the admin to renew.",
+    },
     "file_removed": {"bn": "এই ফাইলটি সরিয়ে ফেলা হয়েছে।", "en": "This file was removed."},
     "premium_locked": {
         "bn": "🔒 <b>{store}</b> একটি প্রিমিয়াম স্টোর।\nঅ্যাক্সেস পেতে নিচের বাটনে চাপ দিন।",
